@@ -7,7 +7,10 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+// In packaged Electron, __dirname is read-only (inside app.asar).
+// Electron main process sets PDF_TRANSLATOR_DATA env var to a writable path.
+const CONFIG_DIR = process.env.PDF_TRANSLATOR_DATA || __dirname;
+const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const DEFAULT_CONFIG = {
   provider: 'anthropic',
   endpoint: 'https://api.anthropic.com',

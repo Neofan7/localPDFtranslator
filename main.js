@@ -1,5 +1,9 @@
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
+
+// Set writable data directory for config.json before loading server
+process.env.PDF_TRANSLATOR_DATA = app.getPath('userData');
+
 const { startServer } = require('./server');
 
 let mainWindow;
