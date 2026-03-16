@@ -1,0 +1,18 @@
+node_modules/
+dist/
+config.json
+*.log
+
+# Test files
+*.pdf
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

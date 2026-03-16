@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PDF Translator</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Noto Sans TC',sans-serif;background:#f8fafc}
+.mb{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;justify-content:center}
+.md{background:#fff;border-radius:12px;padding:24px;max-width:460px;width:90%}
+.md h2{font-size:16px;margin-bottom:16px}.fd{margin-bottom:12px}
+.fd label{display:block;font-size:11px;font-weight:600;color:#475569;margin-bottom:4px}
+.fd input,.fd select{width:100%;padding:7px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;outline:none}
+.fd .h{font-size:10px;color:#94a3b8;margin-top:2px}
+.bt{padding:7px 16px;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
+.b1{background:#6366f1;color:#fff}.b2{background:0;color:#64748b}
+</style></head><body><div id="app"></div>
+<script>
+var Q=function(s){return document.querySelector(s)};
+var S={pdf:null,pgs:[],pB:[],pT:[],glo:{},sCN:false,sc:1.5,busy:false,fn:""};
+async function api(m){var r=await fetch("/api/translate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({messages:m,max_tokens:4000})});if(!r.ok)throw new Error((await r.json()).error||"Fail");return(await r.json()).text}
+async function gC(){return(await fetch("/api/config")).json()}
+async function sC(c){await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(c)})}
+function xB(items,pH){if(!items||!items.length)return[];var p=[];for(var k=0;k<items.length;k++){var it=items[k];if(!it.str.trim())continue;var tx=it.transform;p.push({s:it.str,x:tx[4],y:tx[5],f:Math.abs(tx[3])||Math.abs(tx[0])||12,w:it.width||0})}p.sort(function(a,b){return b.y-a.y||a.x-b.x});
+var ls=[],ln=null;for(var k=0;k<p.length;k++){var i=p[k];if(!ln||Math.abs(i.y-ln.y)>i.f*0.4){if(ln)ls.push(ln);ln={it:[i],y:i.y,x:i.x,ex:i.x+i.w,f:i.f}}else{ln.it.push(i);ln.ex=Math.max(ln.ex,i.x+i.w);ln.x=Math.min(ln.x,i.x);ln.f=Math.max(ln.f,i.f)}}if(ln)ls.push(ln);
+for(var q=0;q<ls.length;q++){var l=ls[q],t="",pe=l.it[0].x;for(var j=0;j<l.it.length;j++){var ii=l.it[j];if(ii.x-pe>ii.f*0.25&&t.length)t+=" ";t+=ii.s;pe=ii.x+ii.w}l.t=t;l.w2=l.ex-l.x}
+var bs=[],cu=null,cB=false;for(var q=0;q<ls.length;q++){var l=ls[q];if(!l.t.trim()){if(cu){bs.push(cu);cu=null;cB=false}continue}var iB=/^[\s]*[^\w\s]\s/.test(l.t)||/^\s*\d+[.\)]\s/.test(l.t);
+if(!cu){cu={ls:[l]};cB=iB}else{var pv=cu.ls[cu.ls.length-1],gap=pv.y-l.y,bf=pv.f,con=gap>0&&gap<bf*2.2,fr=l.f/cu.ls[0].f,fc=fr<0.8||fr>1.2,ic=cB&&!iB&&Math.abs(l.x-pv.x)<bf*3&&con,mi=!cB&&Math.abs(l.x-cu.ls[0].x)>bf*8;
+if(fc||iB||(!ic&&(!con||mi))){bs.push(cu);cu={ls:[l]};cB=iB}else cu.ls.push(l)}}if(cu)bs.push(cu);
+var af=[];for(var q=0;q<bs.length;q++)for(var j=0;j<bs[q].ls.length;j++)af.push(bs[q].ls[j].f);af.sort(function(a,b){return a-b});var mf=af.length?af[Math.floor(af.length/2)]:12;
+return bs.map(function(b){var tx=b.ls.map(function(l){return l.t}).join(" "),has=/[a-zA-Z]{2,}/.test(tx),f0=b.ls[0],fL=b.ls[b.ls.length-1],fs=f0.f;var le=1e9,ri=0;for(var i=0;i<b.ls.length;i++){le=Math.min(le,b.ls[i].x);ri=Math.max(ri,b.ls[i].ex)}
+return{text:tx,has:has,l:le,top:pH-(f0.y+fs*0.85),w:ri-le,h:(pH-(fL.y-fs*0.25))-(pH-(f0.y+fs*0.85)),fs:fs,isT:fs>mf*1.15&&b.ls.length<=3,isB:/^[\s]*[^\w\s]\s/.test(tx)}})}
+async function aC(t){try{var r=await api([{role:"user",content:"Analyze document. Return JSON: domain, organizations, key_terms(15-20). ONLY JSON.\n\n"+t.slice(0,3000)}]);return JSON.parse(r.replace(/```json|```/g,"").trim())}catch(e){return{domain:"general",organizations:"",key_terms:[]}}}
+async function tB(bl,ctx,onP){var B=5,res=new Array(bl.length).fill(null),gl={};var sy='Translate English to Traditional Chinese for "'+( ctx.domain||"general")+'". '+(ctx.key_terms&&ctx.key_terms.length?'Terms: '+ctx.key_terms.join(", ")+'. ':'')+'\nRules:1.Domain terms 2.Keep [N] prefix 3.Tags (TITLE)(BULLET)(BODY)=type,exclude 4.Proper nouns keep EN in () 5.End with GLOSSARY: EN->CN 6.ONLY translations+glossary';
+for(var i=0;i<bl.length;i+=B){var ch=bl.slice(i,i+B),nm=ch.map(function(b,j){return"["+(i+j)+"] "+(b.isT?"(TITLE)":b.isB?"(BULLET)":"(BODY)")+" "+b.text}).join("\n\n");
+try{var raw=await api([{role:"user",content:sy+"\n\nTranslate:\n\n"+nm}]),gi=raw.indexOf("GLOSSARY:"),tp=gi>=0?raw.slice(0,gi):raw,gp=gi>=0?raw.slice(gi+9):"",re=/\[(\d+)\]\s*([\s\S]*?)(?=\n\s*\[|\n\s*GLOSSARY|\s*$)/g,m;
+while((m=re.exec(tp))){var idx=parseInt(m[1]);if(idx<bl.length)res[idx]=m[2].trim()}
+var gs=gp.split("\n");for(var g=0;g<gs.length;g++){var pp=gs[g].split(/->/).map(function(s){return s.trim()});if(pp.length===2&&pp[0]&&pp[1])gl[pp[0]]=pp[1]}}catch(e){console.error(e)}
+if(onP)onP(Math.min(i+B,bl.length),bl.length)}return{translations:res,glossary:gl}}
+function render(){var a=Q("#app");if(!S.pdf)rU(a);else rR(a)}
+function rU(c){c.innerHTML='<div style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px"><div id="dz" style="width:100%;max-width:500px;border:2px dashed #cbd5e1;border-radius:16px;padding:52px 36px;text-align:center;cursor:pointer"><div style="font-size:44px;margin-bottom:12px">&#x1F4C4;</div><div style="font-size:19px;font-weight:700;margin-bottom:6px">PDF Immersive Translator</div><div style="font-size:13px;color:#64748b;line-height:1.8">Drop PDF here or click<br><span style="font-size:11px;opacity:.5">Right-click = toggle CN/EN</span></div><div id="us" style="margin-top:16px;font-size:13px"></div><input id="fi" type="file" accept=".pdf" style="display:none"></div><button id="sb" style="margin-top:20px;background:0;border:1px solid #e2e8f0;border-radius:8px;padding:6px 16px;font-size:12px;color:#64748b;cursor:pointer">Settings</button><div id="cs" style="margin-top:8px;font-size:11px;color:#94a3b8"></div></div>';
+Q("#dz").onclick=function(){Q("#fi").click()};Q("#dz").ondragover=function(e){e.preventDefault()};Q("#dz").ondrop=function(e){e.preventDefault();hF(e.dataTransfer.files[0])};Q("#fi").onchange=function(e){hF(e.target.files[0])};Q("#sb").onclick=sS;
+gC().then(function(c){var ok=c.hasKey||c.provider!=="anthropic";Q("#cs").innerHTML='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:'+(ok?"#22c55e":"#ef4444")+'"></span>'+c.provider+" / "+c.model})}
+function rR(c){c.innerHTML='<div id="rw" style="min-height:100vh"><div style="position:sticky;top:0;z-index:200;background:rgba(15,23,42,.96);padding:7px 14px;display:flex;align-items:center;gap:10px;color:#e2e8f0;font-size:12px"><b>&#x1F4C4;</b> <span style="color:#94a3b8">'+S.fn+'</span> <span style="color:#475569;font-size:10px">'+S.pgs.length+'p</span><div style="flex:1"></div><div id="ta"></div><button onclick="S.sc=Math.max(.5,S.sc-.25);rP()" style="background:rgba(255,255,255,.07);border:none;color:#e2e8f0;width:24px;height:24px;border-radius:4px;cursor:pointer">-</button><span id="zl" style="font-family:monospace;font-size:10px">'+Math.round(S.sc*100)+'%</span><button onclick="S.sc=Math.min(3,S.sc+.25);rP()" style="background:rgba(255,255,255,.07);border:none;color:#e2e8f0;width:24px;height:24px;border-radius:4px;cursor:pointer">+</button> <button onclick="sS()" style="background:rgba(255,255,255,.07);border:none;color:#94a3b8;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x2699;</button> <button onclick="S.pdf=null;S.pgs=[];S.pB=[];S.pT=[];S.sCN=false;S.busy=false;render()" style="background:rgba(239,68,68,.1);border:none;color:#fca5a5;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x2715;</button></div><div id="pb" style="display:none;padding:14px 20px"><div style="max-width:360px;margin:0 auto"><div style="display:flex;justify-content:space-between;font-size:11px;color:#64748b;margin-bottom:5px"><span id="pl">...</span><span id="pp">0%</span></div><div style="height:5px;border-radius:3px;background:#e2e8f0;overflow:hidden"><div id="pf" style="height:100%;border-radius:3px;background:#6366f1;width:0;transition:width .3s"></div></div></div></div><div id="hb" style="display:none;text-align:center;padding:7px;font-size:11px;color:#94a3b8"></div><div id="pc" style="padding:20px;display:flex;flex-direction:column;align-items:center"></div></div>';
+Q("#rw").oncontextmenu=function(e){if(S.busy)return;e.preventDefault();tL()};rP();uT();uH()}
+function rP(){var c=Q("#pc");if(!c)return;c.innerHTML="";if(Q("#zl"))Q("#zl").textContent=Math.round(S.sc*100)+"%";
+for(var i=0;i<S.pgs.length;i++){(function(pg,idx){var w=document.createElement("div");w.style.cssText="position:relative;margin-bottom:20px;box-shadow:0 1px 8px rgba(0,0,0,.06);border-radius:3px;overflow:hidden;background:#fff";
+var cv=document.createElement("canvas");cv.style.display="block";w.appendChild(cv);var vp=pg.getViewport({scale:S.sc});cv.width=vp.width;cv.height=vp.height;pg.render({canvasContext:cv.getContext("2d"),viewport:vp});
+var bl=S.pB[idx]||[],tr=S.pT[idx]||[];for(var bi=0;bi<bl.length;bi++){if(!bl[bi].has||!tr[bi])continue;var b=bl[bi],t=tr[bi],sc=S.sc,v=S.sCN;
+var tp=b.top*sc,le=b.l*sc,wd=b.w*sc,ht=b.h*sc,bf=b.fs*sc,fs=bf;
+if(!b.isT){var cpl=Math.max(1,Math.floor(wd/(fs*0.95))),nl=Math.ceil(t.length/cpl);if(nl*fs*1.5>ht&&ht>0)fs=bf*Math.max(0.5,Math.sqrt(ht/(nl*fs*1.5)))}
+var d=document.createElement("div");d.className="co";d.style.cssText="position:absolute;top:"+tp+"px;left:"+le+"px;width:"+wd+"px;min-height:"+ht+"px;background:#fff;padding:"+sc*0.5+"px;overflow:hidden;transition:opacity .15s;opacity:"+(v?1:0)+";pointer-events:"+(v?"auto":"none")+";z-index:"+(v?5:-1);
+var sp=document.createElement("span");sp.style.cssText="display:block;font-size:"+fs+"px;line-height:"+(b.isT?1.3:1.5)+";font-family:'Noto Sans TC',sans-serif;font-weight:"+(b.isT?700:400)+";color:#111;word-break:break-all";sp.textContent=t;d.appendChild(sp);w.appendChild(d)}
+c.appendChild(w)})(S.pgs[i],i)}}
+function tL(){S.sCN=!S.sCN;document.querySelectorAll(".co").forEach(function(e){e.style.opacity=S.sCN?1:0;e.style.pointerEvents=S.sCN?"auto":"none";e.style.zIndex=S.sCN?5:-1});uT();uH()}
+function uT(){var a=Q("#ta");if(!a||S.busy||!S.pT.length){if(a)a.innerHTML="";return}a.innerHTML='<button onclick="tL()" style="background:'+(S.sCN?"rgba(99,102,241,.22)":"rgba(255,255,255,.07)")+";border:1px solid "+(S.sCN?"rgba(99,102,241,.35)":"rgba(255,255,255,.08)")+";color:"+(S.sCN?"#c7d2fe":"#94a3b8")+';padding:3px 12px;border-radius:5px;cursor:pointer;font-size:11px">'+(S.sCN?"CN":"EN")+"</button>"}
+function uH(){var b=Q("#hb");if(!b||S.busy||!S.pT.length){if(b)b.style.display="none";return}b.style.display="block";b.innerHTML=S.sCN?"Chinese - right-click for English":"English - right-click for Chinese"}
+function sS(){gC().then(function(c){var o=document.createElement("div");o.className="mb";o.innerHTML='<div class="md"><h2>Settings</h2><div class="fd"><label>Provider</label><select id="cp"><option value="anthropic"'+(c.provider==="anthropic"?" selected":"")+'>Anthropic</option><option value="vllm"'+(c.provider==="vllm"?" selected":"")+'>VLLM</option><option value="openai"'+(c.provider==="openai"?" selected":"")+'>OpenAI</option></select></div><div class="fd"><label>Endpoint</label><input id="ce" value="'+(c.endpoint||"")+'"><div class="h">VLLM: http://localhost:8000</div></div><div class="fd"><label>API Key</label><input id="ck" type="password" value="'+(c.apiKey||"")+'"></div><div class="fd"><label>Model</label><input id="cm" value="'+(c.model||"")+'"></div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px"><button class="bt b2" onclick="this.closest(\'.mb\').remove()">Cancel</button><button class="bt b1" id="sv">Save</button></div></div>';
+document.body.appendChild(o);o.onclick=function(e){if(e.target===o)o.remove()};Q("#sv").onclick=async function(){await sC({provider:Q("#cp").value,endpoint:Q("#ce").value,apiKey:Q("#ck").value,model:Q("#cm").value});o.remove();render()}})}
+async function hF(f){if(!f||f.type!=="application/pdf")return;S.fn=f.name;var buf=await f.arrayBuffer();var st=Q("#us");if(st)st.innerHTML='<span style="color:#6366f1">Loading...</span>';
+try{var doc=await pdfjsLib.getDocument({data:buf}).promise;S.pdf=doc;var pa=[];for(var i=1;i<=doc.numPages;i++)pa.push(await doc.getPage(i));S.pgs=pa;render();S.busy=true;var pb=Q("#pb");if(pb)pb.style.display="block";
+uPr("Analyzing...",0,1);var aB=[],aT="",tE=0;for(var i=0;i<pa.length;i++){var co=await pa[i].getTextContent(),pH=pa[i].getViewport({scale:1}).height,bl=xB(co.items,pH);aB.push(bl);for(var j=0;j<bl.length;j++){aT+=bl[j].text+"\n";if(bl[j].has)tE++}}
+S.pB=aB;uPr("Domain...",0,1);var ctx=await aC(aT);var allT=[],mG={},dn=0;
+for(var pi=0;pi<aB.length;pi++){var bl2=aB[pi],eb=bl2.filter(function(b){return b.has});if(!eb.length){allT.push(new Array(bl2.length).fill(null));continue}
+var res=await tB(eb,ctx,function(c2){uPr("Translating...",dn+c2,tE)});dn+=eb.length;var full=new Array(bl2.length).fill(null),ti=0;
+for(var bi=0;bi<bl2.length;bi++){if(bl2[bi].has){full[bi]=res.translations[ti]||null;ti++}}
+allT.push(full);Object.assign(mG,res.glossary);S.pT=allT.slice();S.glo=Object.assign({},mG);rP()}
+S.pT=allT;S.glo=mG;S.busy=false;S.sCN=true;if(pb)pb.style.display="none";rP();uT();uH()}catch(e){console.error(e);if(st)st.innerHTML='<span style="color:#ef4444">'+e.message+"</span>"}}
+function uPr(l,c,t){var p=t>0?Math.round(c/t*100):0;var el=Q("#pl");if(el)el.textContent=l;var pe=Q("#pp");if(pe)pe.textContent=p+"%";var pf=Q("#pf");if(pf)pf.style.width=p+"%"}
+render();
+</script></body></html>

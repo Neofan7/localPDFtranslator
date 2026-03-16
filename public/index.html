@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PDF Translator</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Noto Sans TC',sans-serif;background:#f8fafc}
+.mb{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;justify-content:center}
+.md{background:#fff;border-radius:12px;padding:24px;max-width:460px;width:90%;max-height:90vh;overflow-y:auto}
+.md h2{font-size:16px;margin-bottom:16px}.fd{margin-bottom:12px}
+.fd label{display:block;font-size:11px;font-weight:600;color:#475569;margin-bottom:4px}
+.fd input,.fd select{width:100%;padding:7px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;outline:none}
+.fd .h{font-size:10px;color:#94a3b8;margin-top:2px}
+.bt{padding:7px 16px;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
+.b1{background:#6366f1;color:#fff}.b2{background:0;color:#64748b}
+.sep{border:none;border-top:1px solid #e2e8f0;margin:16px 0}
+</style></head><body><div id="app"></div>
+<script>
+var Q=function(s){return document.querySelector(s)};
+var S={pdf:null,pgs:[],pB:[],pT:[],glo:{},sCN:false,sc:1.5,busy:false,fn:"",cfg:{batchSize:10,sourceLang:"English",targetLang:"Traditional Chinese (繁體中文)",systemPrompt:""}};
+
+/* ===== Translation Log ===== */
+var tLog=[];
+function logEv(type,data){
+  var entry={ts:new Date().toISOString(),type:type,data:data};
+  tLog.push(entry);
+  console.log("[TLog]["+type+"]",typeof data==="string"?data.slice(0,200):data);
+}
+function dlLog(){
+  if(!tLog.length){alert("No log data yet.");return}
+  var name=S.fn?S.fn.replace(/\.pdf$/i,""):"translation";
+  var blob=new Blob([JSON.stringify(tLog,null,2)],{type:"application/json"});
+  var a=document.createElement("a");a.href=URL.createObjectURL(blob);
+  a.download=name+"_log_"+new Date().toISOString().slice(0,19).replace(/[:-]/g,"")+".json";
+  a.click();URL.revokeObjectURL(a.href);
+}
+
+/* ===== API ===== */
+async function api(m,mt){
+  var r=await fetch("/api/translate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({messages:m,max_tokens:mt||4000})});
+  if(!r.ok)throw new Error((await r.json()).error||"Fail");
+  return(await r.json()).text;
+}
+async function gC(){return(await fetch("/api/config")).json()}
+async function sC(c){await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(c)})}
+
+/* ===== Strip tags helper ===== */
+function stripTags(s){
+  return s.replace(/^\s*\(TITLE\)\s*/i,"").replace(/^\s*\(BODY\)\s*/i,"").replace(/^\s*\(BULLET\)\s*/i,"").replace(/^\s*\(TABLE[^)]*\)\s*/i,"").trim();
+}
+
+/* ===== Clean translation: strip model preamble & trailing notes ===== */
+function cleanTx(s){
+  if(!s)return s;
+  var lines=s.split("\n");
+  var start=0,end=lines.length;
+  /* Skip leading preamble lines (English meta-commentary before actual translation) */
+  for(var i=0;i<lines.length;i++){
+    var l=lines[i].trim();
+    if(!l){start=i+1;continue}
+    /* Common preamble patterns from models */
+    if(/^(here[''\u2019]?s |here is |below is |the following |i[''\u2019]?ve |i have |sure[,!.]|certainly|of course|okay|let me|this is |translation of|translated text|complete translation)/i.test(l)){start=i+1;continue}
+    if(/^(adhering|following your|as requested|as instructed|per your)/i.test(l)){start=i+1;continue}
+    if(/^---+$/.test(l)){start=i+1;continue}
+    break;
+  }
+  /* Trim trailing notes/commentary */
+  for(var i=end-1;i>start;i--){
+    var l=lines[i].trim();
+    if(!l){end=i;continue}
+    /* Common trailing patterns */
+    if(/^(note[s]?\s*(on|:|\()|---+$|===+$|\*\*note|considerations|choices|key (term|translation|point)|glossary note|translation note|i hope|let me know|feel free|if you need|please let|happy to)/i.test(l)){end=i;continue}
+    /* Trailing lines that are purely English sentences (no CJK) and look like commentary */
+    if(!/[\u2E80-\u9FFF\uF900-\uFAFF]/.test(l)&&/^[A-Z*\-•]/.test(l)&&l.length>30&&/[.!?:]$/.test(l)){end=i;continue}
+    /* Short trailing labels like "- Formal tone used" or "* Key term: X" */
+    if(!/[\u2E80-\u9FFF\uF900-\uFAFF]/.test(l)&&/^[-•*]\s/.test(l)&&l.length>5){end=i;continue}
+    break;
+  }
+  var result=lines.slice(start,end).join("\n").trim();
+  if(!result)return s.trim();
+  /* Strip mixed-in English source sentences from CJK translation output */
+  var tgt=S.cfg.targetLang||"";
+  if(/chinese|中文|日本|japanese|korean|한국/i.test(tgt)){
+    result=stripMixedEn(result);
+  }
+  return result||s.trim();
+}
+
+/* ===== Strip mixed-in English source sentences from CJK translations ===== */
+function stripMixedEn(s){
+  if(!s)return s;
+  /*
+   * Strategy: split text into sentence-level segments, then remove segments
+   * that are purely English (no CJK chars) and long enough to be source text.
+   * Short English fragments (proper nouns, abbreviations) are preserved.
+   */
+  /* Split on sentence-ending punctuation (both EN and CJK) while keeping delimiters */
+  var parts=s.split(/(?<=[.!?。！？；\n])\s*/);
+  var out=[];
+  for(var i=0;i<parts.length;i++){
+    var seg=parts[i].trim();
+    if(!seg)continue;
+    /* Count CJK characters in this segment */
+    var cjk=0,total=0;
+    for(var j=0;j<seg.length;j++){
+      var code=seg.charCodeAt(j);
+      if(code>0x2E7F&&code<0xFB00)cjk++;
+      if(code>32)total++;
+    }
+    /* If segment has zero CJK characters and is long (>25 chars), it's likely
+       untranslated English source text mixed into the translation — remove it */
+    if(cjk===0&&seg.length>25&&total>15){
+      /* But keep if it looks like a short parenthesized term: (Domain Network) */
+      if(/^\([^)]{1,40}\)$/.test(seg)){out.push(seg);continue}
+      /* Skip this English source sentence */
+      continue;
+    }
+    /* If segment is very long and CJK ratio is extremely low (<10%), likely mixed */
+    if(seg.length>60&&total>0&&cjk/total<0.1){continue}
+    out.push(seg);
+  }
+  var result=out.join(" ").replace(/\s+/g," ").trim();
+  /* If we stripped too much (>80% removed), return original — safety fallback */
+  if(result.length<s.length*0.2)return s;
+  return result||s;
+}
+
+/* ===== Table Detection: Heuristic Fallback ===== */
+function detectTableHeuristic(b){
+if(b.ls.length<2)return null;var tRows=[];
+for(var li=0;li<b.ls.length;li++){var line=b.ls[li];
+if(line.it.length<2)continue;
+var allGaps=[];for(var gi=1;gi<line.it.length;gi++){allGaps.push(line.it[gi].x-(line.it[gi-1].x+line.it[gi-1].w))}
+var sGaps=allGaps.slice().sort(function(a,b2){return a-b2});
+var gapTh=line.f*1.5;
+if(sGaps.length>=2){for(var gi2=0;gi2<sGaps.length-1;gi2++){
+if(sGaps[gi2]<1)continue;var r=sGaps[gi2+1]/sGaps[gi2];
+if(r>1.8&&sGaps[gi2+1]>line.f*0.5){gapTh=(sGaps[gi2]+sGaps[gi2+1])/2;break}}}
+var cells=[],curCell="",curX=line.it[0].x,prevEnd=line.it[0].x;
+for(var ci=0;ci<line.it.length;ci++){var item=line.it[ci],gap=item.x-prevEnd;
+if(ci>0&&gap>gapTh&&curCell.trim()){cells.push({text:curCell.trim(),x:curX});curCell=item.s;curX=item.x}
+else{if(ci>0&&gap>item.f*0.25)curCell+=" ";curCell+=item.s}prevEnd=item.x+item.w}
+if(curCell.trim())cells.push({text:curCell.trim(),x:curX});
+if(cells.length>=2)tRows.push({cells:cells,lineIdx:li})}
+if(tRows.length>=2&&tRows.length>=b.ls.length*0.5){
+var maxR=tRows.reduce(function(a,b2){return b2.cells.length>a.cells.length?b2:a});
+logEv("table_heuristic",{numCols:maxR.cells.length,texts:maxR.cells.map(function(c){return c.text.slice(0,25)})});
+return{colXs:maxR.cells.map(function(c){return c.x}),numCols:maxR.cells.length}}
+return null}
+
+/* ===== Table Detection: AI-Assisted with Pre-computed Clustering ===== */
+async function detectTableAI(b,ctxLines){
+if(b.ls.length<2){console.log("[TableAI] skip: <2 lines");return null}
+var multiLines=0;for(var i=0;i<b.ls.length;i++){if(b.ls[i].it.length>=2)multiLines++}
+if(multiLines<2||multiLines<b.ls.length*0.5){console.log("[TableAI] skip: multiLines="+multiLines+"/"+b.ls.length);return null}
+/* Combine block lines + context lines from adjacent blocks */
+var allLines=b.ls.slice();
+if(ctxLines){for(var ci8=0;ci8<ctxLines.length;ci8++){if(ctxLines[ci8].it&&ctxLines[ci8].it.length>=2)allLines.push(ctxLines[ci8])}}
+console.log("[TableAI] Analyzing block: "+b.ls.length+" lines + "+(allLines.length-b.ls.length)+" context lines");
+/* Collect all x-positions from all lines */
+var allXs=[];for(var li2=0;li2<allLines.length;li2++){for(var ii2=0;ii2<allLines[li2].it.length;ii2++){allXs.push(Math.round(allLines[li2].it[ii2].x))}}
+allXs.sort(function(a,b2){return a-b2});if(allXs.length<4)return null;
+/* Compute average font size for clustering tolerance */
+var avgFs=0;for(var ai=0;ai<allLines.length;ai++)avgFs+=allLines[ai].f;avgFs=avgFs/allLines.length||11;
+var tol=Math.max(8,avgFs*0.8);
+/* ===== STAGE 1: Gap Distribution Analysis (handles wide-column tables) ===== */
+var proposedColXs=null;
+var allGaps=[];
+for(var li3=0;li3<b.ls.length;li3++){var line3=b.ls[li3];if(line3.it.length<2)continue;
+var sorted3=line3.it.slice().sort(function(a,b2){return a.x-b2.x});
+for(var si=0;si<sorted3.length-1;si++){var gv=sorted3[si+1].x-(sorted3[si].x+sorted3[si].w);
+allGaps.push({gap:gv,pos:(sorted3[si].x+sorted3[si].w+sorted3[si+1].x)/2})}}
+if(allGaps.length>=2){
+var splitPt=avgFs*0.5;
+var sG=allGaps.filter(function(g){return g.gap<splitPt});
+var lG=allGaps.filter(function(g){return g.gap>=splitPt});
+if(sG.length>0&&lG.length>0){
+var maxS=-Infinity,minL=Infinity;
+for(var gi=0;gi<sG.length;gi++){if(sG[gi].gap>maxS)maxS=sG[gi].gap}
+for(var gi=0;gi<lG.length;gi++){if(lG[gi].gap<minL)minL=lG[gi].gap}
+if(minL>maxS*1.5){
+var mTh=(maxS+minL)/2;
+console.log("[TableAI] Bimodal gaps: small≤"+Math.round(maxS)+", large≥"+Math.round(minL)+", threshold="+Math.round(mTh));
+/* Extract column boundary positions from large gaps */
+var bdrys=lG.map(function(g){return Math.round(g.pos)}).sort(function(a,b2){return a-b2});
+/* Cluster boundary positions (dedup within tolerance) */
+var uniqB=[bdrys[0]];for(var bi=1;bi<bdrys.length;bi++){if(bdrys[bi]-uniqB[uniqB.length-1]>avgFs*2)uniqB.push(bdrys[bi])}
+/* Derive colXs: for each region between boundaries, find min item x */
+var regions=[{mn:0,mx:uniqB[0]}];
+for(var ri=0;ri<uniqB.length-1;ri++)regions.push({mn:uniqB[ri],mx:uniqB[ri+1]});
+regions.push({mn:uniqB[uniqB.length-1],mx:Infinity});
+var gapColXs=[];
+for(var ri=0;ri<regions.length;ri++){var minX=Infinity;
+for(var li4=0;li4<allLines.length;li4++){for(var ii4=0;ii4<allLines[li4].it.length;ii4++){
+var ix=allLines[li4].it[ii4].x;if(ix>regions[ri].mn-avgFs&&ix<regions[ri].mx+avgFs)minX=Math.min(minX,ix)}}
+if(minX<Infinity)gapColXs.push(Math.round(minX))}
+if(gapColXs.length>=2){proposedColXs=gapColXs;
+console.log("[TableAI] Gap-based: "+proposedColXs.length+" columns at",proposedColXs)}}}}
+/* ===== STAGE 2: X-Clustering Fallback (handles uniform-gap tables like 7-col) ===== */
+if(!proposedColXs){
+var clusters=[[allXs[0]]];for(var xi=1;xi<allXs.length;xi++){
+var lc=clusters[clusters.length-1];if(allXs[xi]-lc[0]<=tol){lc.push(allXs[xi])}else{clusters.push([allXs[xi]])}}
+proposedColXs=clusters.map(function(c){var s=0;for(var i=0;i<c.length;i++)s+=c[i];return Math.round(s/c.length)});
+console.log("[TableAI] X-clustering: "+proposedColXs.length+" columns at",proposedColXs,"(tol="+Math.round(tol)+")")}
+if(proposedColXs.length<2)return null;
+/* Confidence: count block lines with items matching >= 2 distinct clusters */
+function clusterConf(lines,cols,t){var cnt=0;for(var i=0;i<lines.length;i++){var ln=lines[i],mc=0;
+for(var cc=0;cc<cols.length;cc++){for(var ii=0;ii<ln.it.length;ii++){if(Math.abs(ln.it[ii].x-cols[cc])<=t){mc++;break}}}
+if(mc>=2)cnt++}return cnt}
+var conf=clusterConf(b.ls,proposedColXs,tol);
+/* Build text description for AI */
+var desc="";var maxLn=Math.min(allLines.length,25);
+for(var li=0;li<maxLn;li++){var line=allLines[li];
+desc+="LINE "+li+" (y="+Math.round(line.y)+", fs="+Math.round(line.f)+"):\n";
+for(var ii=0;ii<line.it.length;ii++){var it=line.it[ii];
+desc+='  [x='+Math.round(it.x)+' w='+Math.round(it.w)+'] "'+it.s+'"\n'}}
+/* AI prompt: ask AI to VALIDATE pre-computed clusters (not discover from scratch) */
+var prompt="You are a table structure analyzer for PDF text items.\n\n"+desc+"\n"+
+"PROPOSED COLUMNS (algorithmically computed from gap distribution analysis):\n"+
+proposedColXs.length+" columns at x-positions: ["+proposedColXs.join(", ")+"]\n\n"+
+"TASK: Determine if these items form a table.\n"+
+"- Items at similar x-positions across different lines = same column\n"+
+"- The proposed column positions above were computed by grouping similar x-coordinates\n"+
+"- Accept the proposed positions if they look correct, or adjust if needed\n"+
+"- If this is NOT a table (just regular paragraph text), return columns:0\n\n"+
+"Return ONLY valid JSON:\n"+
+'{"columns":N,"colXs":[x1,x2,...]} or {"columns":0}\n';
+logEv("table_ai_input",{lines:allLines.length,blockLines:b.ls.length,items:allXs.length,proposedCols:proposedColXs,confidence:conf+"/"+b.ls.length,preview:desc.slice(0,500)});
+try{
+console.log("[TableAI] sending API request...");
+var raw=await api([{role:"user",content:prompt}],500);
+console.log("[TableAI] AI response:",raw);logEv("table_ai_raw",raw);
+var parsed;try{parsed=JSON.parse(raw.replace(/```json|```/g,"").trim())}catch(e){
+var cM=raw.match(/colXs[:\s]*\[([^\]]+)\]/);var nM=raw.match(/columns[:\s]*(\d+)/);
+if(cM&&nM)parsed={columns:parseInt(nM[1]),colXs:cM[1].split(",").map(Number)}}
+if(parsed&&parsed.columns>=2&&parsed.colXs&&parsed.colXs.length>=2){
+var valid=true;for(var vi=1;vi<parsed.colXs.length;vi++){if(parsed.colXs[vi]<=parsed.colXs[vi-1]){valid=false;break}}
+if(valid){logEv("table_ai_result",{numCols:parsed.colXs.length,colXs:parsed.colXs});
+console.log("[TableAI] AI confirmed: "+parsed.colXs.length+" columns at",parsed.colXs);
+return{colXs:parsed.colXs,numCols:parsed.colXs.length}}}
+/* AI said not-a-table explicitly */
+if(parsed&&parsed.columns===0){console.log("[TableAI] AI says not a table");logEv("table_ai_not_table",{});return null}
+/* AI gave invalid/unexpected response: use pre-computed clusters if confident */
+if(conf>=b.ls.length*0.5){console.log("[TableAI] AI invalid, using pre-computed clusters (conf="+conf+"/"+b.ls.length+")");
+logEv("table_ai_fallback_clusters",{cols:proposedColXs,conf:conf});return{colXs:proposedColXs,numCols:proposedColXs.length}}
+logEv("table_ai_invalid",{raw:raw,parsed:parsed});return null;
+}catch(e){console.error("[TableAI] ERROR:",e.message);logEv("table_ai_error",e.message);
+/* API error: use pre-computed clusters if confident enough */
+if(conf>=b.ls.length*0.5){console.log("[TableAI] API error, using clusters (conf="+conf+"/"+b.ls.length+")");
+return{colXs:proposedColXs,numCols:proposedColXs.length}}return null}}
+
+/* ===== Table Detection: Coordinator (AI first, heuristic fallback) ===== */
+async function detectTable(b,ctxLines){
+var aiResult=await detectTableAI(b,ctxLines);
+if(aiResult)return aiResult;
+return detectTableHeuristic(b)}
+
+/* ===== Text Block Extraction ===== */
+async function xB(items,pH){if(!items||!items.length)return[];var p=[];for(var k=0;k<items.length;k++){var it=items[k];if(!it.str.trim())continue;var tx=it.transform;var ef=Math.abs(tx[3])||Math.abs(tx[0])||12;p.push({s:it.str,x:tx[4],y:tx[5],f:ef,w:it.width||(it.str.length*ef*0.55)})}p.sort(function(a,b){return b.y-a.y||a.x-b.x});
+var ls=[],ln=null;for(var k=0;k<p.length;k++){var i=p[k];if(!ln||Math.abs(i.y-ln.y)>i.f*0.6){if(ln)ls.push(ln);ln={it:[i],y:i.y,x:i.x,ex:i.x+i.w,f:i.f}}else{ln.it.push(i);ln.ex=Math.max(ln.ex,i.x+i.w);ln.x=Math.min(ln.x,i.x);ln.f=Math.max(ln.f,i.f)}}if(ln)ls.push(ln);
+for(var q=0;q<ls.length;q++){var l=ls[q],t="",pe=l.it[0].x;for(var j=0;j<l.it.length;j++){var ii=l.it[j];if(ii.x-pe>ii.f*0.25&&t.length)t+=" ";t+=ii.s;pe=ii.x+ii.w}l.t=t;l.w2=l.ex-l.x}
+var bs=[],cu=null,cB=false;for(var q=0;q<ls.length;q++){var l=ls[q];if(!l.t.trim()){if(cu){bs.push(cu);cu=null;cB=false}continue}var iB=/^[\s]*[^\w\s]\s/.test(l.t)||/^\s*\d+[.\)]\s/.test(l.t);
+if(!cu){cu={ls:[l]};cB=iB}else{var pv=cu.ls[cu.ls.length-1],gap=pv.y-l.y,bf=pv.f,con=gap>=0&&gap<bf*1.8,fr=l.f/cu.ls[0].f,fc=fr<0.7||fr>1.3,ic=cB&&!iB&&Math.abs(l.x-pv.x)<bf*3&&con,mi=!cB&&Math.abs(l.x-cu.ls[0].x)>bf*8;
+/* Center-alignment check: don't split centered text (e.g., figure captions) */
+if(mi&&con){var cx1=cu.ls[0].x+cu.ls[0].w2/2,cx2=l.x+l.w2/2;if(Math.abs(cx1-cx2)<bf*3)mi=false}
+if(fc||iB||(!ic&&(!con||mi))){bs.push(cu);cu={ls:[l]};cB=iB}else cu.ls.push(l)}}if(cu)bs.push(cu);
+/* Table detection: AI-assisted with heuristic fallback */
+for(var q=0;q<bs.length;q++){var b=bs[q];
+/* Collect context lines from adjacent blocks for AI analysis */
+var ctxLines=[];
+if(q>0)for(var ci9=0;ci9<bs[q-1].ls.length;ci9++)ctxLines.push(bs[q-1].ls[ci9]);
+if(q<bs.length-1)for(var ci9=0;ci9<bs[q+1].ls.length;ci9++)ctxLines.push(bs[q+1].ls[ci9]);
+var det=await detectTable(b,ctxLines);
+if(det){b.isTable=true;b.colXs=det.colXs;b.numCols=det.numCols;
+logEv("table_detected",{blockIdx:q,lines:b.ls.length,numCols:b.numCols,colXs:b.colXs.map(function(x){return Math.round(x*10)/10})});
+/* Rebuild rows using colXs for ALL lines */
+b.rows=[];for(var li2=0;li2<b.ls.length;li2++){var line2=b.ls[li2];var rowCells=[];for(var rc=0;rc<b.colXs.length;rc++)rowCells.push("");
+for(var ii3=0;ii3<line2.it.length;ii3++){var itm3=line2.it[ii3],itmC=itm3.x+itm3.w/2;var bestCol=0;
+for(var bc=b.colXs.length-1;bc>=0;bc--){if(itmC>=b.colXs[bc]-itm3.f){bestCol=bc;break}}
+if(rowCells[bestCol])rowCells[bestCol]+=" ";rowCells[bestCol]+=itm3.s}
+b.rows.push(rowCells.map(function(c2){return c2.trim()}))}}}
+/* Merge physical table rows into logical rows, tracking line ranges */
+for(var q2=0;q2<bs.length;q2++){var b2=bs[q2];if(!b2.isTable||b2.rows.length<=1)continue;
+var mR=[],cR2=null,slIdx=0;
+/* Detect header: first physical row where all non-empty cells are short, lack terminal punctuation, and have varying content */
+var startR=0,fR=b2.rows[0],fNe=fR.filter(function(c){return c.trim().length>0});
+var isHdr2=fNe.length>=2&&fNe.every(function(c){return c.trim().length<=40&&!/[.!?。！？]$/.test(c.trim())});
+if(isHdr2){/* Reject if all cells have identical text (e.g. "Assessment based on" x3 — that's content, not a header) */
+  var uniq=[];for(var ui=0;ui<fNe.length;ui++){if(uniq.indexOf(fNe[ui].trim())<0)uniq.push(fNe[ui].trim())}
+  if(uniq.length>1){mR.push({cells:fR,fl:0,tl:0,isHdr:true});startR=1}}
+for(var ri2=startR;ri2<b2.rows.length;ri2++){var pr=b2.rows[ri2];
+if(!cR2){cR2=pr.slice();slIdx=ri2}else{for(var ci5=0;ci5<Math.max(cR2.length,pr.length);ci5++){if(ci5>=cR2.length)cR2.push(pr[ci5]||"");else if(ci5<pr.length&&pr[ci5].trim())cR2[ci5]=(cR2[ci5]+" "+pr[ci5]).trim()}}
+var ne2=cR2.filter(function(c){return c.trim().length>0});var allT=ne2.length>0&&ne2.every(function(c){return /[.!?。！？)\]]$/.test(c.trim())});
+if(allT||ri2===b2.rows.length-1){mR.push({cells:cR2,fl:slIdx,tl:ri2});cR2=null}}
+b2.logicalRows=mR;b2.numCols=Math.max.apply(null,mR.map(function(r){return r.cells.length}))}
+/* Merge adjacent single-line header block into table block */
+for(var q3=bs.length-1;q3>=1;q3--){var tb=bs[q3];if(!tb.isTable||!tb.colXs||tb.colXs.length<2)continue;
+var hb=bs[q3-1];if(hb.isTable||hb.ls.length!==1)continue;
+var hL=hb.ls[0],tL2=tb.ls[0];
+if(Math.abs(hL.x-tL2.x)>tL2.f*8)continue;
+if(hL.y-tL2.y>tL2.f*4||hL.y<tL2.y)continue;
+var hC=[];for(var ci6=0;ci6<tb.colXs.length;ci6++){var cL3=tb.colXs[ci6],cR3=ci6<tb.colXs.length-1?tb.colXs[ci6+1]:Infinity;var ct2="";
+for(var ii2=0;ii2<hL.it.length;ii2++){var itm=hL.it[ii2],ic2=itm.x+itm.w/2;if(ic2>=cL3-itm.f*2&&ic2<cR3+itm.f*2){if(ct2)ct2+=" ";ct2+=itm.s}}hC.push(ct2.trim())}
+var neH=hC.filter(function(c){return c.length>0});
+if(neH.length>=2){tb.ls.unshift(hL);/* Shift line indices in logicalRows */
+if(tb.logicalRows){for(var lr=0;lr<tb.logicalRows.length;lr++){tb.logicalRows[lr].fl++;tb.logicalRows[lr].tl++}
+tb.logicalRows.unshift({cells:hC,fl:0,tl:0,isHdr:true})}hb.skip=true}}
+/* Merge adjacent single/double-line block AFTER table (footer merge, e.g. percentage row) */
+for(var q4=0;q4<bs.length-1;q4++){var tb2=bs[q4];if(!tb2.isTable||!tb2.colXs||tb2.colXs.length<2)continue;
+var fb=bs[q4+1];if(fb.isTable||fb.ls.length>2||fb.skip)continue;
+var fL2=fb.ls[0];if(!fL2.it||fL2.it.length<2)continue;
+/* Check vertical proximity: footer block should be close below table's last line */
+var tLastL=tb2.ls[tb2.ls.length-1];if(tLastL.y-fL2.y>tLastL.f*3||fL2.y>tLastL.y)continue;
+/* Check if footer items align with table columns */
+var alCnt=0;for(var fi=0;fi<fL2.it.length;fi++){for(var ci7=0;ci7<tb2.colXs.length;ci7++){
+if(Math.abs(fL2.it[fi].x-tb2.colXs[ci7])<=fL2.f*1.5){alCnt++;break}}}
+if(alCnt<2||alCnt<fL2.it.length*0.4)continue;
+console.log("[TableMerge] Footer merge: "+fb.ls.length+" lines into table (aligned="+alCnt+"/"+fL2.it.length+")");
+for(var fli=0;fli<fb.ls.length;fli++){var fLine3=fb.ls[fli];
+var fRow=[];for(var ci7=0;ci7<tb2.colXs.length;ci7++)fRow.push("");
+for(var fi2=0;fi2<fLine3.it.length;fi2++){var itm4=fLine3.it[fi2],ic4=itm4.x+itm4.w/2;var bc4=0;
+for(var bc5=tb2.colXs.length-1;bc5>=0;bc5--){if(ic4>=tb2.colXs[bc5]-itm4.f){bc4=bc5;break}}
+if(fRow[bc4])fRow[bc4]+=" ";fRow[bc4]+=itm4.s}
+var fRowT=fRow.map(function(c){return c.trim()});var nli=tb2.ls.length;
+tb2.ls.push(fLine3);tb2.rows.push(fRowT);
+if(tb2.logicalRows)tb2.logicalRows.push({cells:fRowT,fl:nli,tl:nli})}
+fb.skip=true;logEv("table_footer_merge",{blockIdx:q4,footerLines:fb.ls.length,footerTexts:fb.ls.map(function(l){return l.t.slice(0,50)})})}
+var af=[];for(var q=0;q<bs.length;q++)for(var j=0;j<bs[q].ls.length;j++)af.push(bs[q].ls[j].f);af.sort(function(a,b){return a-b});var mf=af.length?af[Math.floor(af.length/2)]:12;
+/* Output: expand table blocks into individual cell blocks with precise PDF coordinates */
+var result=[];bs.filter(function(b){return !b.skip}).forEach(function(b){
+if(b.isTable&&b.logicalRows&&b.colXs){
+  var cXs=b.colXs,bRi=Math.max.apply(null,b.ls.map(function(l){return l.ex}));
+  for(var ri=0;ri<b.logicalRows.length;ri++){var lr=b.logicalRows[ri];
+    var fLine=b.ls[lr.fl],lLine=b.ls[lr.tl],fs=fLine.f;
+    var rTop=pH-(fLine.y+fs*1.0),rBot=pH-(lLine.y-fs*0.45),rH=rBot-rTop;
+    for(var ci=0;ci<lr.cells.length;ci++){
+      if(!lr.cells[ci].trim())continue;
+      var cL=cXs[ci],cR=ci<cXs.length-1?cXs[ci+1]:bRi+fs*0.3;
+      result.push({text:lr.cells[ci],has:/[a-zA-Z]{2,}/.test(lr.cells[ci]),l:cL,top:rTop,w:cR-cL,h:rH,fs:fs,isT:lr.isHdr||false,isB:false,isTableCell:true})}}
+}else{
+  var tx=b.ls.map(function(l){return l.t}).join(" "),has=/[a-zA-Z]{2,}/.test(tx),f0=b.ls[0],fL=b.ls[b.ls.length-1],fs=f0.f;var le=1e9,ri=0;for(var i=0;i<b.ls.length;i++){le=Math.min(le,b.ls[i].x);ri=Math.max(ri,b.ls[i].ex)}
+  result.push({text:tx,has:has,l:le,top:pH-(f0.y+fs*1.0),w:ri-le+fs*0.3,h:(pH-(fL.y-fs*0.45))-(pH-(f0.y+fs*1.0)),fs:fs,isT:fs>mf*1.15&&b.ls.length<=3,isB:/^[\s]*[^\w\s]\s/.test(tx)})}});
+return result}
+
+/* ===== Default System Prompt Builder ===== */
+function buildSystemPrompt(ctx,glossary){
+  var src=S.cfg.sourceLang||"English";
+  var tgt=S.cfg.targetLang||"Traditional Chinese (繁體中文)";
+  var custom=S.cfg.systemPrompt||"";
+
+  var base='You are a professional '+src+' to '+tgt+' translator.\n'+
+    'Domain: "'+(ctx.domain||"general")+'".\n'+
+    (ctx.key_terms&&ctx.key_terms.length?'Key terms: '+ctx.key_terms.join(", ")+'.\n':'')+
+    '\nSTRICT RULES:\n'+
+    '1. Translate each numbered block [N] to natural '+tgt+'.\n'+
+    '2. Keep the [N] prefix exactly as given.\n'+
+    '3. Do NOT include (TITLE), (BODY), (BULLET), (TABLE) tags in your output.\n'+
+    '4. For proper nouns, keep '+src+' in parentheses on first mention.\n'+
+    '5. Translate EVERY block. Do not skip any.\n'+
+    '6. Translate the COMPLETE text of each block sentence by sentence. Do NOT summarize, shorten, or omit ANY sentences. Every sentence in the source must appear in the translation.\n'+
+    '7. For very short text blocks (under 5 words), translate concisely without adding parenthetical English.\n'+
+    '7a. For (TABLE) blocks: translate as concisely as possible. These are table cells with limited space. Use the shortest natural '+tgt+' phrasing. Do NOT add parenthetical English for proper nouns in table cells.\n'+
+    '8. After all translations, add a line "GLOSSARY:" followed by "'+src+' -> '+tgt+'" term pairs.\n'+
+    '9. Output ONLY the [N] translations and GLOSSARY. No preamble, no notes, no explanations, no commentary. Do NOT write "Here is the translation" or "Notes on Choices". Start directly with [0].\n'+
+    '10. Do NOT include the original '+src+' text in your translation. Output ONLY '+tgt+'. Never mix source and target languages sentence by sentence.\n'+
+    '\nExample output format:\n'+
+    '[0] first translated block\n\n'+
+    '[1] second translated block\n\n'+
+    'GLOSSARY:\nTerm -> translation';
+
+  /* Append accumulated glossary for consistency */
+  if(glossary&&Object.keys(glossary).length){
+    var gKeys=Object.keys(glossary).slice(0,50);
+    var gls=gKeys.map(function(k){return k+' -> '+glossary[k]});
+    base+='\n\nESTABLISHED GLOSSARY (use these translations consistently):\n'+gls.join('\n');
+  }
+
+  if(custom.trim()){
+    base+='\n\nADDITIONAL INSTRUCTIONS FROM USER:\n'+custom;
+  }
+  return base;
+}
+
+/* ===== Domain Analysis ===== */
+async function aC(t){
+  var prompt="You are a document analyzer. Read the text below and return ONLY a JSON object with these fields:\n"+
+    "- domain: the subject area (e.g. \"cybersecurity\", \"medical\", \"finance\")\n"+
+    "- organizations: key organizations mentioned\n"+
+    "- key_terms: array of 15-20 important technical terms\n\n"+
+    "Return ONLY valid JSON, no markdown, no explanation.\n\n"+t.slice(0,3000);
+  logEv("domain_input",{textLen:t.length,preview:t.slice(0,300)});
+  try{
+    var r=await api([{role:"user",content:prompt}],2000);
+    logEv("domain_raw_response",r);
+    /* Try JSON parse first */
+    try{var parsed=JSON.parse(r.replace(/```json|```/g,"").trim());logEv("domain_result",parsed);return parsed}catch(je){}
+    /* Fallback: extract from free text for weaker models */
+    console.warn("Domain analysis JSON parse failed, using fallback extraction");
+    var domain="general",key_terms=[];
+    var dm=r.match(/domain[:\s]*"?([^"\n,}]+)/i);
+    if(dm)domain=dm[1].trim().replace(/["\s]+$/,"");
+    var ktm=r.match(/key.?terms[:\s]*\[([^\]]+)\]/i);
+    if(ktm){key_terms=ktm[1].split(",").map(function(s){return s.trim().replace(/^["'\s]+|["'\s]+$/g,"")}).filter(function(s){return s.length>1})}
+    if(!key_terms.length){
+      var bullets=r.match(/[-•*]\s*(.+)/g);
+      if(bullets)key_terms=bullets.slice(0,20).map(function(s){return s.replace(/^[-•*]\s*/,"").trim()});
+    }
+    var fb={domain:domain,organizations:"",key_terms:key_terms};
+    logEv("domain_result_fallback",fb);
+    return fb;
+  }catch(e){logEv("domain_error",e.message);return{domain:"general",organizations:"",key_terms:[]}}
+}
+
+/* ===== Translation Engine (improved) ===== */
+async function tB(bl,ctx,onP,initGlossary){
+  var B=S.cfg.batchSize||10;
+  var res=new Array(bl.length).fill(null),gl=Object.assign({},initGlossary||{});
+  var maxTk=B<=5?4000:(B<=10?6000:8000);
+
+  for(var i=0;i<bl.length;){
+    var bEnd=Math.min(i+B,bl.length);
+    var ch=bl.slice(i,bEnd);
+    var curMaxTk=maxTk;
+    /* Rebuild system prompt each batch with accumulated glossary */
+    var sy=buildSystemPrompt(ctx,gl);
+    var nm=ch.map(function(b,j){
+      return"["+(i+j)+"] "+(b.isT?"(TITLE) ":b.isB?"(BULLET) ":b.isTableCell?"(TABLE) ":"(BODY) ")+b.text;
+    }).join("\n\n");
+
+    logEv("batch_input",{batchStart:i,blockCount:ch.length,blocks:ch.map(function(b,j){return{idx:i+j,type:b.isT?"TITLE":b.isB?"BULLET":b.isTableCell?"CELL":"BODY",textLen:b.text.length,text:b.text.slice(0,150),pos:{top:b.top,l:b.l,w:b.w,h:b.h,fs:b.fs}}})});
+
+    /* Try up to 2 times per batch */
+    var attempts=0, success=false;
+    while(attempts<2 && !success){
+      attempts++;
+      try{
+        var raw=await api([{role:"user",content:sy+"\n\nTranslate the following:\n\n"+nm}],curMaxTk);
+        logEv("batch_raw_response",{batchStart:i,attempt:attempts,responseLen:raw.length,response:raw});
+        var gi=raw.indexOf("GLOSSARY:");
+        var tp=gi>=0?raw.slice(0,gi):raw;
+        var gp=gi>=0?raw.slice(gi+9):"";
+
+        /* Parse translations - primary regex */
+        var re=/\[(\d+)\]\s*([\s\S]*?)(?=\n\s*\[|\n\s*GLOSSARY|\s*$)/g,m;
+        var batchFound=0;
+        while((m=re.exec(tp))){
+          var idx=parseInt(m[1]);
+          if(idx<bl.length){
+            var rawTx=stripTags(m[2].trim());
+            res[idx]=cleanTx(rawTx);
+            batchFound++;
+          }
+        }
+        /* Fallback regex: try bracket variants (N), N., N) if primary found too few */
+        if(batchFound<ch.length){
+          var re2=/(?:^|\n)\s*(?:\[(\d+)\]|\((\d+)\)|(\d+)[.\)])\s*([\s\S]*?)(?=\n\s*(?:\[|\(|\d+[.\)])|\n\s*GLOSSARY|\s*$)/g;
+          while((m=re2.exec(tp))){
+            var idx2=parseInt(m[1]||m[2]||m[3]);
+            if(idx2<bl.length&&!res[idx2]){var rawTx2=stripTags(m[4].trim());res[idx2]=cleanTx(rawTx2);batchFound++}
+          }
+        }
+        /* Single-block batch: use entire response if nothing matched */
+        if(batchFound===0&&ch.length===1){
+          var cleanTp=cleanTx(tp.replace(/^\s*\[?\d*\]?\s*/,"").trim());
+          if(cleanTp&&cleanTp.length>0){res[i]=stripTags(cleanTp);batchFound=1}
+        }
+
+        /* Parse glossary */
+        var gs=gp.split("\n");
+        for(var g=0;g<gs.length;g++){
+          var pp=gs[g].split(/->|→/).map(function(s){return s.trim().replace(/^[\*\-•]\s*/,"")});
+          if(pp.length===2&&pp[0]&&pp[1])gl[pp[0]]=pp[1];
+        }
+
+        /* Log parsed results for this batch */
+        var parsedLog=[];for(var pi2=i;pi2<i+ch.length;pi2++){parsedLog.push({idx:pi2,translation:res[pi2]?res[pi2].slice(0,100):null,len:res[pi2]?res[pi2].length:0})}
+        logEv("batch_parsed",{batchStart:i,found:batchFound,expected:ch.length,results:parsedLog});
+
+        /* Check if we got all blocks in this batch */
+        if(batchFound>=ch.length){
+          success=true;
+        }else if(attempts<2){
+          console.warn("Batch at "+i+": got "+batchFound+"/"+ch.length+", retrying...");
+        }else{
+          console.warn("Batch at "+i+": got "+batchFound+"/"+ch.length+" after retry");
+          success=true; /* accept partial results */
+        }
+      }catch(e){
+        console.error("Batch error (attempt "+attempts+"):",e);
+        if(attempts>=2) success=true; /* give up but continue */
+      }
+    }
+
+    /* Retry blocks with null (missing) or truncated translations individually */
+    for(var ci=0;ci<ch.length;ci++){
+      var bIdx=i+ci,srcB=ch[ci],tr=res[bIdx];
+      var needsRetry=!tr||(srcB.text.length>30&&!srcB.isT&&tr.length<srcB.text.length*0.25);
+      if(needsRetry){
+        logEv("retry_start",{blockIdx:bIdx,reason:tr?"truncated":"missing",srcLen:srcB.text.length,trLen:tr?tr.length:0,srcText:srcB.text.slice(0,200)});
+        try{
+          var tgt=S.cfg.targetLang||"Traditional Chinese (繁體中文)";
+          var rSy='Translate the COMPLETE text below to '+tgt+'.\n'+
+            'CRITICAL RULES:\n'+
+            '- Translate EVERY sentence. Do NOT summarize or shorten.\n'+
+            '- Output ONLY the translated text in '+tgt+'.\n'+
+            '- Do NOT include any preamble like "Here is the translation".\n'+
+            '- Do NOT include any notes, explanations, or commentary.\n'+
+            '- Do NOT include section headers like "Notes on Choices".\n'+
+            '- Do NOT include the original English text. Output ONLY '+tgt+', never mix English and '+tgt+' sentence by sentence.\n'+
+            '- Start your response directly with the '+tgt+' translation.\n';
+          if(Object.keys(gl).length){rSy+='Glossary:\n'+Object.keys(gl).slice(0,30).map(function(k){return k+' -> '+gl[k]}).join('\n')+'\n'}
+          var rRaw=await api([{role:"user",content:rSy+'\nText to translate:\n'+srcB.text}],2000);
+          logEv("retry_raw_response",{blockIdx:bIdx,responseLen:rRaw?rRaw.length:0,response:rRaw});
+          if(rRaw){
+            var cleaned=cleanTx(rRaw.replace(/^\s*\[?\d*\]?\s*/,"").trim());
+            var maxLen=srcB.text.length*1.5;
+            if(cleaned&&cleaned.length>maxLen){
+              logEv("retry_rejected_hallucination",{blockIdx:bIdx,cleanedLen:cleaned.length,srcLen:srcB.text.length,maxAllowed:maxLen,preview:cleaned.slice(0,150)});
+            }else if(cleaned&&(!tr||cleaned.length>tr.length)){
+              res[bIdx]=cleaned;
+              logEv("retry_success",{blockIdx:bIdx,cleanedLen:cleaned.length,preview:cleaned.slice(0,150)});
+            }else{
+              logEv("retry_no_improvement",{blockIdx:bIdx,cleanedLen:cleaned?cleaned.length:0,oldLen:tr?tr.length:0});
+            }
+          }
+        }catch(re2){logEv("retry_error",{blockIdx:bIdx,error:re2.message})}
+      }
+    }
+
+    if(onP)onP(Math.min(bEnd,bl.length),bl.length);
+    i=bEnd;
+  }
+  return{translations:res,glossary:gl};
+}
+
+/* ===== Render ===== */
+function render(){var a=Q("#app");if(!S.pdf)rU(a);else rR(a)}
+
+function rU(c){c.innerHTML='<div style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px"><div id="dz" style="width:100%;max-width:500px;border:2px dashed #cbd5e1;border-radius:16px;padding:52px 36px;text-align:center;cursor:pointer"><div style="font-size:44px;margin-bottom:12px">&#x1F4C4;</div><div style="font-size:19px;font-weight:700;margin-bottom:6px">PDF Immersive Translator</div><div style="font-size:13px;color:#64748b;line-height:1.8">Drop PDF here or click<br><span style="font-size:11px;opacity:.5">Right-click = toggle CN/EN</span></div><div id="us" style="margin-top:16px;font-size:13px"></div><input id="fi" type="file" accept=".pdf" style="display:none"></div><button id="sb" style="margin-top:20px;background:0;border:1px solid #e2e8f0;border-radius:8px;padding:6px 16px;font-size:12px;color:#64748b;cursor:pointer">Settings</button><div id="cs" style="margin-top:8px;font-size:11px;color:#94a3b8"></div></div>';
+Q("#dz").onclick=function(){Q("#fi").click()};Q("#dz").ondragover=function(e){e.preventDefault()};Q("#dz").ondrop=function(e){e.preventDefault();hF(e.dataTransfer.files[0])};Q("#fi").onchange=function(e){hF(e.target.files[0])};Q("#sb").onclick=sS;
+gC().then(function(c){S.cfg.batchSize=c.batchSize||10;S.cfg.sourceLang=c.sourceLang||"English";S.cfg.targetLang=c.targetLang||"Traditional Chinese (繁體中文)";S.cfg.systemPrompt=c.systemPrompt||"";var ok=c.hasKey||c.provider!=="anthropic";Q("#cs").innerHTML='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:'+(ok?"#22c55e":"#ef4444")+'"></span>'+c.provider+" / "+c.model})}
+
+function rR(c){c.innerHTML='<div id="rw" style="min-height:100vh"><div style="position:sticky;top:0;z-index:200;background:rgba(15,23,42,.96);padding:7px 14px;display:flex;align-items:center;gap:10px;color:#e2e8f0;font-size:12px"><b>&#x1F4C4;</b> <span style="color:#94a3b8">'+S.fn+'</span> <span style="color:#475569;font-size:10px">'+S.pgs.length+'p</span><div style="flex:1"></div><div id="ta"></div><button onclick="S.sc=Math.max(.5,S.sc-.25);rP()" style="background:rgba(255,255,255,.07);border:none;color:#e2e8f0;width:24px;height:24px;border-radius:4px;cursor:pointer">-</button><span id="zl" style="font-family:monospace;font-size:10px">'+Math.round(S.sc*100)+'%</span><button onclick="S.sc=Math.min(3,S.sc+.25);rP()" style="background:rgba(255,255,255,.07);border:none;color:#e2e8f0;width:24px;height:24px;border-radius:4px;cursor:pointer">+</button> <button onclick="sS()" style="background:rgba(255,255,255,.07);border:none;color:#94a3b8;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x2699;</button> <button onclick="dlLog()" style="background:rgba(255,255,255,.07);border:none;color:#94a3b8;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x1F4CB; Log</button> <button onclick="S.pdf=null;S.pgs=[];S.pB=[];S.pT=[];S.sCN=false;S.busy=false;render()" style="background:rgba(239,68,68,.1);border:none;color:#fca5a5;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x2715;</button></div><div id="pb" style="display:none;padding:14px 20px"><div style="max-width:360px;margin:0 auto"><div style="display:flex;justify-content:space-between;font-size:11px;color:#64748b;margin-bottom:5px"><span id="pl">...</span><span id="pp">0%</span></div><div style="height:5px;border-radius:3px;background:#e2e8f0;overflow:hidden"><div id="pf" style="height:100%;border-radius:3px;background:#6366f1;width:0;transition:width .3s"></div></div></div></div><div id="hb" style="display:none;text-align:center;padding:7px;font-size:11px;color:#94a3b8"></div><div id="pc" style="padding:20px;display:flex;flex-direction:column;align-items:center"></div></div>';
+Q("#rw").oncontextmenu=function(e){if(S.busy)return;e.preventDefault();tL()};rP();uT();uH()}
+
+function rP(){var c=Q("#pc");if(!c)return;c.innerHTML="";if(Q("#zl"))Q("#zl").textContent=Math.round(S.sc*100)+"%";
+for(var i=0;i<S.pgs.length;i++){(function(pg,idx){var w=document.createElement("div");w.style.cssText="position:relative;margin-bottom:20px;box-shadow:0 1px 8px rgba(0,0,0,.06);border-radius:3px;overflow:hidden;background:#fff";
+var cv=document.createElement("canvas");cv.style.display="block";w.appendChild(cv);var vp=pg.getViewport({scale:S.sc});cv.width=vp.width;cv.height=vp.height;pg.render({canvasContext:cv.getContext("2d"),viewport:vp});
+var bl=S.pB[idx]||[],tr=S.pT[idx]||[],sc=S.sc,v=S.sCN;
+/* Merge adjacent non-title, non-table-cell blocks with similar font size to fix hyperlink paragraph fragmentation */
+var mg=[];for(var bi=0;bi<bl.length;bi++){if(!bl[bi].has||!tr[bi])continue;var b=bl[bi],t=tr[bi];var la=mg.length?mg[mg.length-1]:null;
+var cm=la&&!b.isT&&!la.isT&&!b.isTableCell&&!la.isTableCell&&Math.abs(b.fs-la.fs)/Math.max(la.fs,1)<0.15;
+if(cm){var vc=b.top>=la.top&&b.top<la.top+la.h+b.fs*0.5;var ho=!(b.l+b.w<la.l-b.fs*2||b.l>la.l+la.w+b.fs*2);cm=vc&&ho}
+if(cm){var r1=la.l+la.w,r2=b.l+b.w;la.l=Math.min(la.l,b.l);la.w=Math.max(r1,r2)-la.l;la.h=Math.max(la.h,(b.top+b.h)-la.top);la.fs=Math.max(la.fs,b.fs);la.tx+=t}
+else{mg.push({top:b.top,l:b.l,w:b.w,h:b.h,fs:b.fs,isT:b.isT,isTableCell:b.isTableCell,tx:t})}}
+c.appendChild(w);
+for(var mi=0;mi<mg.length;mi++){var m=mg[mi],tp=m.top*sc,le=m.l*sc,wd=m.w*sc,ht=m.h*sc,bf=m.fs*sc,fs=bf;
+var lh=m.isT?1.3:m.isTableCell?1.2:1.5;
+if(!m.isT){
+  /* CJK-aware character width estimation */
+  var cjkCnt=0,ascCnt=0;
+  for(var ci3=0;ci3<m.tx.length;ci3++){if(m.tx.charCodeAt(ci3)>0x2E7F)cjkCnt++;else ascCnt++}
+  var avgCW=cjkCnt>ascCnt?1.0:0.6;
+  var cpl=Math.max(1,Math.floor(wd/(fs*avgCW)));
+  var nl=Math.ceil(m.tx.length/cpl);
+  var minRatio=m.isTableCell?0.15:0.35;
+  if(nl*fs*lh>ht&&ht>0){var ideal=Math.sqrt(ht*wd/(m.tx.length*lh*avgCW));fs=Math.max(bf*minRatio,Math.min(bf,ideal))}
+}
+var d=document.createElement("div");d.className="co";
+if(m.isTableCell){
+  /* Table cells: inset inside cell boundaries to preserve PDF table grid lines */
+  var ins=Math.max(1,sc*1.5);
+  d.style.cssText="position:absolute;top:"+(tp+ins)+"px;left:"+(le+ins)+"px;width:"+(wd-ins*2)+"px;height:"+(ht-ins*2)+"px;background:#fff;overflow:hidden;padding:"+Math.max(1,sc*0.5)+"px;transition:opacity .15s;opacity:"+(v?1:0)+";pointer-events:"+(v?"auto":"none")+";z-index:"+(v?5:-1);
+}else{
+  var px=sc*2,py=sc*1;
+  d.style.cssText="position:absolute;top:"+(tp-py)+"px;left:"+(le-px)+"px;width:"+(wd+px*2)+"px;height:"+(ht+py*2)+"px;background:#fff;overflow:hidden;padding:"+(py+sc*0.5)+"px "+(px+sc*0.5)+"px;transition:opacity .15s;opacity:"+(v?1:0)+";pointer-events:"+(v?"auto":"none")+";z-index:"+(v?5:-1);
+}
+var sp=document.createElement("span");sp.style.cssText="display:block;font-size:"+fs+"px;line-height:"+(m.isT?1.3:m.isTableCell?1.15:1.5)+";font-family:'Noto Sans TC',sans-serif;font-weight:"+(m.isT?700:400)+";color:#111;overflow-wrap:break-word;word-break:"+(m.isTableCell?"break-all":"normal");sp.textContent=m.tx;d.appendChild(sp);
+w.appendChild(d);
+/* Post-render height check: iteratively shrink font if content overflows */
+if(v&&d.scrollHeight>d.clientHeight+2){
+var minFs2=m.isTableCell?bf*0.15:bf*0.3;
+var curFs=fs,spEl=d.querySelector("span");if(spEl){while(curFs>minFs2&&d.scrollHeight>d.clientHeight+2){curFs*=0.9;spEl.style.fontSize=curFs+"px"}}
+}
+}})(S.pgs[i],i)}}
+
+function tL(){S.sCN=!S.sCN;document.querySelectorAll(".co").forEach(function(e){e.style.opacity=S.sCN?1:0;e.style.pointerEvents=S.sCN?"auto":"none";e.style.zIndex=S.sCN?5:-1});uT();uH()}
+function uT(){var a=Q("#ta");if(!a||S.busy||!S.pT.length){if(a)a.innerHTML="";return}a.innerHTML='<button onclick="tL()" style="background:'+(S.sCN?"rgba(99,102,241,.22)":"rgba(255,255,255,.07)")+";border:1px solid "+(S.sCN?"rgba(99,102,241,.35)":"rgba(255,255,255,.08)")+";color:"+(S.sCN?"#c7d2fe":"#94a3b8")+';padding:3px 12px;border-radius:5px;cursor:pointer;font-size:11px">'+(S.sCN?"CN":"EN")+"</button>"}
+function uH(){var b=Q("#hb");if(!b||S.busy||!S.pT.length){if(b)b.style.display="none";return}b.style.display="block";b.innerHTML=S.sCN?"Chinese - right-click for English":"English - right-click for Chinese"}
+
+/* ===== Settings ===== */
+function sS(){gC().then(function(c){var o=document.createElement("div");o.className="mb";
+var sp=c.systemPrompt||"";
+o.innerHTML='<div class="md"><h2>Settings</h2>'+
+'<div class="fd"><label>Provider</label><select id="cp"><option value="anthropic"'+(c.provider==="anthropic"?" selected":"")+'>Anthropic</option><option value="ollama"'+(c.provider==="ollama"?" selected":"")+'>Ollama (Local)</option><option value="vllm"'+(c.provider==="vllm"?" selected":"")+'>VLLM</option><option value="openai"'+(c.provider==="openai"?" selected":"")+'>OpenAI Compatible</option></select></div>'+
+'<div class="fd"><label>Endpoint</label><input id="ce" value="'+(c.endpoint||"")+'"><div class="h">Ollama: http://localhost:11434 / VLLM: http://localhost:8000</div></div>'+
+'<div class="fd"><label>API Key</label><input id="ck" type="password" value="'+(c.apiKey||"")+'"><div class="h">Ollama does not need API Key</div></div>'+
+'<div class="fd"><label>Model</label><input id="cm" value="'+(c.model||"")+'"></div>'+
+'<hr class="sep">'+
+'<div style="font-size:12px;font-weight:600;color:#334155;margin-bottom:12px">Translation</div>'+
+'<div style="display:flex;gap:8px"><div class="fd" style="flex:1"><label>Source Language</label><input id="csl" value="'+(c.sourceLang||"English")+'"></div>'+
+'<div class="fd" style="flex:1"><label>Target Language</label><input id="ctl" value="'+(c.targetLang||"Traditional Chinese (繁體中文)")+'"></div></div>'+
+'<div class="fd"><label>Custom Prompt (optional)</label><textarea id="csp" rows="4" style="width:100%;padding:7px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;outline:none;resize:vertical;font-family:inherit"></textarea>'+
+'<div class="h">Extra instructions appended to the system prompt. E.g. "Use formal tone" or "Keep all acronyms in English"</div></div>'+
+'<hr class="sep">'+
+'<div style="font-size:12px;font-weight:600;color:#334155;margin-bottom:12px">Performance</div>'+
+'<div class="fd"><label>Context Length (num_ctx)</label><select id="cnc"><option value="4096"'+(c.numCtx==4096?" selected":"")+'>4096 (Low VRAM)</option><option value="8192"'+(c.numCtx==8192?" selected":"")+'>8192 (Default)</option><option value="16384"'+((c.numCtx==16384)?" selected":"")+'>16384 (Recommended)</option><option value="32768"'+(c.numCtx==32768?" selected":"")+'>32768 (High VRAM)</option><option value="65536"'+(c.numCtx==65536?" selected":"")+'>65536 (Max)</option></select><div class="h">Larger = better quality, more VRAM. Ollama only.</div></div>'+
+'<div class="fd"><label>Batch Size (blocks per API call)</label><select id="cbs"><option value="5"'+(c.batchSize==5?" selected":"")+'>5 (Safe)</option><option value="10"'+(c.batchSize==10?" selected":"")+'>10 (Balanced)</option><option value="15"'+(c.batchSize==15?" selected":"")+'>15 (Fast)</option><option value="20"'+(c.batchSize==20?" selected":"")+'>20 (Aggressive)</option></select><div class="h">More blocks per call = faster. Needs larger context.</div></div>'+
+'<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px"><button class="bt b2" onclick="this.closest(\'.mb\').remove()">Cancel</button><button class="bt b1" id="sv">Save</button></div></div>';
+document.body.appendChild(o);
+Q("#csp").value=sp;
+var epDef={anthropic:"https://api.anthropic.com",ollama:"http://localhost:11434",vllm:"http://localhost:8000",openai:"https://api.openai.com/v1"};
+var mdDef={anthropic:"claude-sonnet-4-20250514",ollama:"gemma3:12b",vllm:"",openai:"gpt-4o"};
+Q("#cp").onchange=function(){var p=this.value,ce=Q("#ce"),cm=Q("#cm");if(epDef[p])ce.value=epDef[p];if(mdDef[p]!==undefined)cm.value=mdDef[p]};
+o.onclick=function(e){if(e.target===o)o.remove()};
+Q("#sv").onclick=async function(){
+  var cfg={provider:Q("#cp").value,endpoint:Q("#ce").value,apiKey:Q("#ck").value,model:Q("#cm").value,numCtx:parseInt(Q("#cnc").value),batchSize:parseInt(Q("#cbs").value),sourceLang:Q("#csl").value,targetLang:Q("#ctl").value,systemPrompt:Q("#csp").value};
+  await sC(cfg);
+  S.cfg.batchSize=cfg.batchSize;
+  S.cfg.sourceLang=cfg.sourceLang;
+  S.cfg.targetLang=cfg.targetLang;
+  S.cfg.systemPrompt=cfg.systemPrompt;
+  o.remove();render()}})}
+
+/* ===== File Handler ===== */
+async function hF(f){if(!f||f.type!=="application/pdf")return;S.fn=f.name;tLog=[];logEv("file_start",{name:f.name,size:f.size});var buf=await f.arrayBuffer();var st=Q("#us");if(st)st.innerHTML='<span style="color:#6366f1">Loading...</span>';
+try{var doc=await pdfjsLib.getDocument({data:buf}).promise;S.pdf=doc;var pa=[];for(var i=1;i<=doc.numPages;i++)pa.push(await doc.getPage(i));S.pgs=pa;render();S.busy=true;var pb=Q("#pb");if(pb)pb.style.display="block";
+uPr("Analyzing...",0,1);var aB=[],aT="",tE=0;for(var i=0;i<pa.length;i++){var co=await pa[i].getTextContent(),pH=pa[i].getViewport({scale:1}).height,bl=await xB(co.items,pH);aB.push(bl);
+/* Log extracted blocks per page */
+logEv("blocks_extracted",{page:i+1,pageHeight:pH,blockCount:bl.length,blocks:bl.map(function(b,bi){return{idx:bi,type:b.isT?"TITLE":b.isB?"BULLET":b.isTableCell?"CELL":"BODY",hasEng:b.has,textLen:b.text.length,text:b.text.slice(0,200),pos:{top:Math.round(b.top*10)/10,l:Math.round(b.l*10)/10,w:Math.round(b.w*10)/10,h:Math.round(b.h*10)/10,fs:Math.round(b.fs*10)/10}}})});
+for(var j=0;j<bl.length;j++){aT+=bl[j].text+"\n";if(bl[j].has)tE++}}
+S.pB=aB;uPr("Domain...",0,1);var ctx=await aC(aT);var allT=[],mG={},dn=0;
+for(var pi=0;pi<aB.length;pi++){var bl2=aB[pi],eb=bl2.filter(function(b){return b.has});if(!eb.length){allT.push(new Array(bl2.length).fill(null));continue}
+var res=await tB(eb,ctx,function(c2){uPr("Translating...",dn+c2,tE)},mG);dn+=eb.length;var full=new Array(bl2.length).fill(null),ti=0;
+for(var bi=0;bi<bl2.length;bi++){if(bl2[bi].has){full[bi]=res.translations[ti]||null;ti++}}
+logEv("page_translations",{page:pi+1,translations:full.map(function(t,ti){return{idx:ti,translation:t?t.slice(0,150):null,len:t?t.length:0}})});
+allT.push(full);Object.assign(mG,res.glossary);S.pT=allT.slice();S.glo=Object.assign({},mG);rP()}
+S.pT=allT;S.glo=mG;S.busy=false;S.sCN=true;if(pb)pb.style.display="none";var pb2=Q("#pb");if(pb2)pb2.style.display="none";
+logEv("translation_complete",{pages:allT.length,glossarySize:Object.keys(mG).length,glossary:mG});
+rP();uT();uH()}catch(e){logEv("translation_error",e.message);console.error(e);if(st)st.innerHTML='<span style="color:#ef4444">'+e.message+"</span>"}}
+
+function uPr(l,c,t){var p=t>0?Math.round(c/t*100):0;var el=Q("#pl");if(el)el.textContent=l;var pe=Q("#pp");if(pe)pe.textContent=p+"%";var pf=Q("#pf");if(pf)pf.style.width=p+"%"}
+render();
+</script></body></html>

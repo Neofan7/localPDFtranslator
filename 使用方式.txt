@@ -1,0 +1,30 @@
+PDF Immersive Translator - 使用方式
+=====================================
+
+【首次使用】
+1. 安裝 Node.js: https://nodejs.org/ (下載 LTS 版本，安裝時全部預設即可)
+2. 雙擊 run.bat
+3. 瀏覽器會自動開啟 http://localhost:3000
+4. 點擊 Settings，設定你的 AI 模型:
+
+   本機 Ollama:
+     Provider = Ollama (Local)
+     Endpoint = http://localhost:11434
+     Model = gemma3:12b (或其他你安裝的模型)
+
+   線上 API (Anthropic):
+     Provider = Anthropic
+     Endpoint = https://api.anthropic.com
+     API Key = 你的 API Key
+     Model = claude-sonnet-4-20250514
+
+5. 上傳 PDF，等待翻譯完成
+6. 右鍵切換 中文/英文
+
+【日常使用】
+1. 雙擊 run.bat
+2. 上傳 PDF
+3. 右鍵切換語言
+
+【關閉】
+關閉 run.bat 的黑色視窗即可
