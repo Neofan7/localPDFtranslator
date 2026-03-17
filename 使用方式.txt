@@ -11,12 +11,24 @@ PDF Immersive Translator - 使用方式
      Provider = Ollama (Local)
      Endpoint = http://localhost:11434
      Model = gemma3:12b (或其他你安裝的模型)
+     Context Size = 8192 (依模型調整，越大越好但越吃記憶體)
 
    線上 API (Anthropic):
      Provider = Anthropic
      Endpoint = https://api.anthropic.com
      API Key = 你的 API Key
      Model = claude-sonnet-4-20250514
+
+   其他 OpenAI 相容 API (vLLM, LM Studio 等):
+     Provider = OpenAI Compatible
+     Endpoint = 你的 API 網址
+     API Key = 你的 API Key (如需要)
+     Model = 模型名稱
+
+   進階設定:
+     Batch Size = 每次翻譯的區塊數量 (預設 10，越大越快但品質可能下降)
+     Source Language = 來源語言 (預設 English)
+     Target Language = 目標語言 (預設 Traditional Chinese)
 
 5. 上傳 PDF，等待翻譯完成
 6. 右鍵切換 中文/英文
@@ -25,6 +37,18 @@ PDF Immersive Translator - 使用方式
 1. 雙擊 run.bat
 2. 上傳 PDF
 3. 右鍵切換語言
+
+【翻譯中途操作】
+- 點擊右上角 X 按鈕：取消目前翻譯，回到上傳畫面
+- 直接上傳新 PDF：自動取消前一個翻譯任務，開始翻譯新檔案
+- 翻譯進行中無法切換語言，翻譯完成後才能右鍵切換
+
+【功能說明】
+- 表格自動辨識：AI 會偵測 PDF 中的表格，逐欄翻譯保持結構
+- 領域分析：翻譯前自動分析文件主題，提升專業術語準確度
+- 術語表累積：翻譯過程中自動建立術語對照表，確保全文一致性
+- 縮放：使用工具列的 +/- 按鈕調整顯示大小
+- Log：點擊 Log 按鈕可下載完整翻譯日誌 (JSON 格式)
 
 【關閉】
 關閉 run.bat 的黑色視窗即可
