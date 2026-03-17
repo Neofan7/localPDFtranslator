@@ -11,17 +11,30 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Electron main process sets PDF_TRANSLATOR_DATA env var to a writable path.
 const CONFIG_DIR = process.env.PDF_TRANSLATOR_DATA || __dirname;
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
-const DEFAULT_CONFIG = {
-  provider: 'anthropic',
-  endpoint: 'https://api.anthropic.com',
-  apiKey: '',
-  model: 'claude-sonnet-4-20250514',
-  numCtx: 8192,
-  batchSize: 10,
-  sourceLang: 'English',
-  targetLang: 'Traditional Chinese (繁體中文)',
-  systemPrompt: ''
-};
+// Bundled default config: ships with the app so first launch has full settings.
+// Try loading defaults from bundled config.json (inside app.asar), fall back to hardcoded.
+const BUNDLED_CONFIG_PATH = path.join(__dirname, 'config.json');
+const DEFAULT_CONFIG = (function() {
+  try {
+    if (fs.existsSync(BUNDLED_CONFIG_PATH)) {
+      const c = JSON.parse(fs.readFileSync(BUNDLED_CONFIG_PATH, 'utf8'));
+      // Never bundle the API key — user must enter it themselves
+      c.apiKey = '';
+      return c;
+    }
+  } catch (e) { /* ignore */ }
+  return {
+    provider: 'ollama',
+    endpoint: 'http://localhost:11434',
+    apiKey: '',
+    model: 'gemma3:12b',
+    numCtx: 8192,
+    batchSize: 5,
+    sourceLang: 'English',
+    targetLang: 'Traditional Chinese',
+    systemPrompt: ''
+  };
+})();
 
 function loadConfig() {
   try {

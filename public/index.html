@@ -17,7 +17,7 @@
 </style></head><body><div id="app"></div>
 <script>
 var Q=function(s){return document.querySelector(s)};
-var S={pdf:null,pgs:[],pB:[],pT:[],glo:{},sCN:false,sc:1.5,busy:false,fn:"",cfg:{batchSize:10,sourceLang:"English",targetLang:"Traditional Chinese (繁體中文)",systemPrompt:""}};
+var S={pdf:null,pgs:[],pB:[],pT:[],glo:{},sCN:false,sc:1.5,busy:false,fn:"",cfg:{batchSize:10,sourceLang:"English",targetLang:"Traditional Chinese (繁體中文)",systemPrompt:""},sessionId:0,abortCtrl:null};
 
 /* ===== Translation Log ===== */
 var tLog=[];
@@ -36,8 +36,10 @@ function dlLog(){
 }
 
 /* ===== API ===== */
-async function api(m,mt){
-  var r=await fetch("/api/translate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({messages:m,max_tokens:mt||4000})});
+async function api(m,mt,signal){
+  var opts={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({messages:m,max_tokens:mt||4000})};
+  if(signal)opts.signal=signal;
+  var r=await fetch("/api/translate",opts);
   if(!r.ok)throw new Error((await r.json()).error||"Fail");
   return(await r.json()).text;
 }
@@ -125,9 +127,46 @@ function stripMixedEn(s){
   return result||s;
 }
 
+/* ===== Table Pre-filter: Reject OBVIOUS paragraphs before table detection ===== */
+/* Conservative: only reject clear-cut paragraphs. When in doubt, let table detector decide. */
+/* Key insight: paragraph lines have uniform small gaps; table lines have large column-separator gaps. */
+function isLikelyParagraph(b){
+if(b.ls.length<2)return false;
+/* CHECK 1: Bullet / numbered list (tightened to avoid matching table data like "1-5%") */
+var bulletCount=0;
+for(var i=0;i<b.ls.length;i++){var lt=b.ls[i].t;
+  if(/^[\s]*[•●○▪▸▹►–—]\s/.test(lt)){bulletCount++;continue}
+  if(/^\s*\d+[.\)]\s+[a-zA-Z]/.test(lt)){bulletCount++;continue}
+  if(/^\s*[a-zA-Z][.\)]\s+[a-zA-Z]/.test(lt)){bulletCount++;continue}}
+if(bulletCount>=3||(bulletCount>=2&&bulletCount>=b.ls.length*0.5)){
+  console.log("[TablePreFilter] Rejected: bullet list ("+bulletCount+"/"+b.ls.length+")");return true}
+/* CHECK 2: Gap-pattern analysis — core signal distinguishing tables from paragraphs */
+/* Paragraph: items separated by small uniform gaps (word spacing) */
+/* Table: items separated by at least one LARGE gap (column separator) */
+var multiItemLines=0,paraLikeLines=0;
+for(var i=0;i<b.ls.length;i++){var line=b.ls[i];
+  if(line.it.length<2)continue;multiItemLines++;
+  var sorted=line.it.slice().sort(function(a,b2){return a.x-b2.x});
+  var gaps=[];for(var j=1;j<sorted.length;j++){gaps.push(sorted[j].x-(sorted[j-1].x+sorted[j-1].w))}
+  if(!gaps.length)continue;
+  var sGaps=gaps.slice().sort(function(a,b2){return a-b2});
+  var medGap=sGaps[Math.floor(sGaps.length/2)],maxGap=sGaps[sGaps.length-1];
+  var fs=line.f||12;var gapRatio=(medGap>0.5)?(maxGap/medGap):999;
+  if(maxGap<fs*1.5&&gapRatio<3){paraLikeLines++}
+  else if(gapRatio<2.5&&maxGap<fs*2.5){paraLikeLines++}}
+if(multiItemLines>=2&&paraLikeLines>=multiItemLines*0.75){
+  console.log("[TablePreFilter] Rejected: paragraph gap pattern ("+paraLikeLines+"/"+multiItemLines+" lines uniform gaps)");return true}
+/* CHECK 3: Single-item prose (PDF rendered whole lines as one chunk + long sentences) */
+var singleCount=0,totalWords=0;
+for(var i=0;i<b.ls.length;i++){if(b.ls[i].it.length<=1)singleCount++;totalWords+=b.ls[i].t.trim().split(/\s+/).length}
+var avgWords=totalWords/b.ls.length;
+if(singleCount>=b.ls.length*0.7&&avgWords>12&&b.ls.length>=3){
+  console.log("[TablePreFilter] Rejected: single-item prose (avgWords="+avgWords.toFixed(1)+", single="+singleCount+"/"+b.ls.length+")");return true}
+return false}
+
 /* ===== Table Detection: Heuristic Fallback ===== */
 function detectTableHeuristic(b){
-if(b.ls.length<2)return null;var tRows=[];
+if(b.ls.length<2)return null;if(isLikelyParagraph(b))return null;var tRows=[];
 for(var li=0;li<b.ls.length;li++){var line=b.ls[li];
 if(line.it.length<2)continue;
 var allGaps=[];for(var gi=1;gi<line.it.length;gi++){allGaps.push(line.it[gi].x-(line.it[gi-1].x+line.it[gi-1].w))}
@@ -149,8 +188,9 @@ return{colXs:maxR.cells.map(function(c){return c.x}),numCols:maxR.cells.length}}
 return null}
 
 /* ===== Table Detection: AI-Assisted with Pre-computed Clustering ===== */
-async function detectTableAI(b,ctxLines){
+async function detectTableAI(b,ctxLines,signal){
 if(b.ls.length<2){console.log("[TableAI] skip: <2 lines");return null}
+if(isLikelyParagraph(b)){console.log("[TableAI] skip: paragraph pre-filter");return null}
 var multiLines=0;for(var i=0;i<b.ls.length;i++){if(b.ls[i].it.length>=2)multiLines++}
 if(multiLines<2||multiLines<b.ls.length*0.5){console.log("[TableAI] skip: multiLines="+multiLines+"/"+b.ls.length);return null}
 /* Combine block lines + context lines from adjacent blocks */
@@ -218,17 +258,22 @@ desc+='  [x='+Math.round(it.x)+' w='+Math.round(it.w)+'] "'+it.s+'"\n'}}
 var prompt="You are a table structure analyzer for PDF text items.\n\n"+desc+"\n"+
 "PROPOSED COLUMNS (algorithmically computed from gap distribution analysis):\n"+
 proposedColXs.length+" columns at x-positions: ["+proposedColXs.join(", ")+"]\n\n"+
-"TASK: Determine if these items form a table.\n"+
+"TASK: Determine if these items form a REAL TABLE (not a paragraph).\n"+
+"- A real table has DISCRETE DATA in distinct columns (e.g. numbers, labels, categories)\n"+
 "- Items at similar x-positions across different lines = same column\n"+
 "- The proposed column positions above were computed by grouping similar x-coordinates\n"+
 "- Accept the proposed positions if they look correct, or adjust if needed\n"+
-"- If this is NOT a table (just regular paragraph text), return columns:0\n\n"+
+"- Return columns:0 if this is ANY of the following (NOT a table):\n"+
+"  * Regular paragraph text (flowing sentences)\n"+
+"  * Bullet point lists or numbered lists\n"+
+"  * Text that reads as continuous prose across items\n"+
+"  * Items that are just word fragments of the same sentence split by PDF rendering\n\n"+
 "Return ONLY valid JSON:\n"+
 '{"columns":N,"colXs":[x1,x2,...]} or {"columns":0}\n';
 logEv("table_ai_input",{lines:allLines.length,blockLines:b.ls.length,items:allXs.length,proposedCols:proposedColXs,confidence:conf+"/"+b.ls.length,preview:desc.slice(0,500)});
 try{
 console.log("[TableAI] sending API request...");
-var raw=await api([{role:"user",content:prompt}],500);
+var raw=await api([{role:"user",content:prompt}],500,signal);
 console.log("[TableAI] AI response:",raw);logEv("table_ai_raw",raw);
 var parsed;try{parsed=JSON.parse(raw.replace(/```json|```/g,"").trim())}catch(e){
 var cM=raw.match(/colXs[:\s]*\[([^\]]+)\]/);var nM=raw.match(/columns[:\s]*(\d+)/);
@@ -250,13 +295,13 @@ if(conf>=b.ls.length*0.5){console.log("[TableAI] API error, using clusters (conf
 return{colXs:proposedColXs,numCols:proposedColXs.length}}return null}}
 
 /* ===== Table Detection: Coordinator (AI first, heuristic fallback) ===== */
-async function detectTable(b,ctxLines){
-var aiResult=await detectTableAI(b,ctxLines);
+async function detectTable(b,ctxLines,signal){
+var aiResult=await detectTableAI(b,ctxLines,signal);
 if(aiResult)return aiResult;
 return detectTableHeuristic(b)}
 
 /* ===== Text Block Extraction ===== */
-async function xB(items,pH){if(!items||!items.length)return[];var p=[];for(var k=0;k<items.length;k++){var it=items[k];if(!it.str.trim())continue;var tx=it.transform;var ef=Math.abs(tx[3])||Math.abs(tx[0])||12;p.push({s:it.str,x:tx[4],y:tx[5],f:ef,w:it.width||(it.str.length*ef*0.55)})}p.sort(function(a,b){return b.y-a.y||a.x-b.x});
+async function xB(items,pH,signal){if(!items||!items.length)return[];var p=[];for(var k=0;k<items.length;k++){var it=items[k];if(!it.str.trim())continue;var tx=it.transform;var ef=Math.abs(tx[3])||Math.abs(tx[0])||12;p.push({s:it.str,x:tx[4],y:tx[5],f:ef,w:it.width||(it.str.length*ef*0.55)})}p.sort(function(a,b){return b.y-a.y||a.x-b.x});
 var ls=[],ln=null;for(var k=0;k<p.length;k++){var i=p[k];if(!ln||Math.abs(i.y-ln.y)>i.f*0.6){if(ln)ls.push(ln);ln={it:[i],y:i.y,x:i.x,ex:i.x+i.w,f:i.f}}else{ln.it.push(i);ln.ex=Math.max(ln.ex,i.x+i.w);ln.x=Math.min(ln.x,i.x);ln.f=Math.max(ln.f,i.f)}}if(ln)ls.push(ln);
 for(var q=0;q<ls.length;q++){var l=ls[q],t="",pe=l.it[0].x;for(var j=0;j<l.it.length;j++){var ii=l.it[j];if(ii.x-pe>ii.f*0.25&&t.length)t+=" ";t+=ii.s;pe=ii.x+ii.w}l.t=t;l.w2=l.ex-l.x}
 var bs=[],cu=null,cB=false;for(var q=0;q<ls.length;q++){var l=ls[q];if(!l.t.trim()){if(cu){bs.push(cu);cu=null;cB=false}continue}var iB=/^[\s]*[^\w\s]\s/.test(l.t)||/^\s*\d+[.\)]\s/.test(l.t);
@@ -270,7 +315,7 @@ for(var q=0;q<bs.length;q++){var b=bs[q];
 var ctxLines=[];
 if(q>0)for(var ci9=0;ci9<bs[q-1].ls.length;ci9++)ctxLines.push(bs[q-1].ls[ci9]);
 if(q<bs.length-1)for(var ci9=0;ci9<bs[q+1].ls.length;ci9++)ctxLines.push(bs[q+1].ls[ci9]);
-var det=await detectTable(b,ctxLines);
+var det=await detectTable(b,ctxLines,signal);
 if(det){b.isTable=true;b.colXs=det.colXs;b.numCols=det.numCols;
 logEv("table_detected",{blockIdx:q,lines:b.ls.length,numCols:b.numCols,colXs:b.colXs.map(function(x){return Math.round(x*10)/10})});
 /* Rebuild rows using colXs for ALL lines */
@@ -382,7 +427,7 @@ function buildSystemPrompt(ctx,glossary){
 }
 
 /* ===== Domain Analysis ===== */
-async function aC(t){
+async function aC(t,signal){
   var prompt="You are a document analyzer. Read the text below and return ONLY a JSON object with these fields:\n"+
     "- domain: the subject area (e.g. \"cybersecurity\", \"medical\", \"finance\")\n"+
     "- organizations: key organizations mentioned\n"+
@@ -390,7 +435,7 @@ async function aC(t){
     "Return ONLY valid JSON, no markdown, no explanation.\n\n"+t.slice(0,3000);
   logEv("domain_input",{textLen:t.length,preview:t.slice(0,300)});
   try{
-    var r=await api([{role:"user",content:prompt}],2000);
+    var r=await api([{role:"user",content:prompt}],2000,signal);
     logEv("domain_raw_response",r);
     /* Try JSON parse first */
     try{var parsed=JSON.parse(r.replace(/```json|```/g,"").trim());logEv("domain_result",parsed);return parsed}catch(je){}
@@ -412,7 +457,7 @@ async function aC(t){
 }
 
 /* ===== Translation Engine (improved) ===== */
-async function tB(bl,ctx,onP,initGlossary){
+async function tB(bl,ctx,onP,initGlossary,signal){
   var B=S.cfg.batchSize||10;
   var res=new Array(bl.length).fill(null),gl=Object.assign({},initGlossary||{});
   var maxTk=B<=5?4000:(B<=10?6000:8000);
@@ -434,7 +479,7 @@ async function tB(bl,ctx,onP,initGlossary){
     while(attempts<2 && !success){
       attempts++;
       try{
-        var raw=await api([{role:"user",content:sy+"\n\nTranslate the following:\n\n"+nm}],curMaxTk);
+        var raw=await api([{role:"user",content:sy+"\n\nTranslate the following:\n\n"+nm}],curMaxTk,signal);
         logEv("batch_raw_response",{batchStart:i,attempt:attempts,responseLen:raw.length,response:raw});
         var gi=raw.indexOf("GLOSSARY:");
         var tp=gi>=0?raw.slice(0,gi):raw;
@@ -509,7 +554,7 @@ async function tB(bl,ctx,onP,initGlossary){
             '- Do NOT include the original English text. Output ONLY '+tgt+', never mix English and '+tgt+' sentence by sentence.\n'+
             '- Start your response directly with the '+tgt+' translation.\n';
           if(Object.keys(gl).length){rSy+='Glossary:\n'+Object.keys(gl).slice(0,30).map(function(k){return k+' -> '+gl[k]}).join('\n')+'\n'}
-          var rRaw=await api([{role:"user",content:rSy+'\nText to translate:\n'+srcB.text}],2000);
+          var rRaw=await api([{role:"user",content:rSy+'\nText to translate:\n'+srcB.text}],2000,signal);
           logEv("retry_raw_response",{blockIdx:bIdx,responseLen:rRaw?rRaw.length:0,response:rRaw});
           if(rRaw){
             var cleaned=cleanTx(rRaw.replace(/^\s*\[?\d*\]?\s*/,"").trim());
@@ -540,7 +585,7 @@ function rU(c){c.innerHTML='<div style="min-height:100vh;display:flex;flex-direc
 Q("#dz").onclick=function(){Q("#fi").click()};Q("#dz").ondragover=function(e){e.preventDefault()};Q("#dz").ondrop=function(e){e.preventDefault();hF(e.dataTransfer.files[0])};Q("#fi").onchange=function(e){hF(e.target.files[0])};Q("#sb").onclick=sS;
 gC().then(function(c){S.cfg.batchSize=c.batchSize||10;S.cfg.sourceLang=c.sourceLang||"English";S.cfg.targetLang=c.targetLang||"Traditional Chinese (繁體中文)";S.cfg.systemPrompt=c.systemPrompt||"";var ok=c.hasKey||c.provider!=="anthropic";Q("#cs").innerHTML='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:'+(ok?"#22c55e":"#ef4444")+'"></span>'+c.provider+" / "+c.model})}
 
-function rR(c){c.innerHTML='<div id="rw" style="min-height:100vh"><div style="position:sticky;top:0;z-index:200;background:rgba(15,23,42,.96);padding:7px 14px;display:flex;align-items:center;gap:10px;color:#e2e8f0;font-size:12px"><b>&#x1F4C4;</b> <span style="color:#94a3b8">'+S.fn+'</span> <span style="color:#475569;font-size:10px">'+S.pgs.length+'p</span><div style="flex:1"></div><div id="ta"></div><button onclick="S.sc=Math.max(.5,S.sc-.25);rP()" style="background:rgba(255,255,255,.07);border:none;color:#e2e8f0;width:24px;height:24px;border-radius:4px;cursor:pointer">-</button><span id="zl" style="font-family:monospace;font-size:10px">'+Math.round(S.sc*100)+'%</span><button onclick="S.sc=Math.min(3,S.sc+.25);rP()" style="background:rgba(255,255,255,.07);border:none;color:#e2e8f0;width:24px;height:24px;border-radius:4px;cursor:pointer">+</button> <button onclick="sS()" style="background:rgba(255,255,255,.07);border:none;color:#94a3b8;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x2699;</button> <button onclick="dlLog()" style="background:rgba(255,255,255,.07);border:none;color:#94a3b8;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x1F4CB; Log</button> <button onclick="S.pdf=null;S.pgs=[];S.pB=[];S.pT=[];S.sCN=false;S.busy=false;render()" style="background:rgba(239,68,68,.1);border:none;color:#fca5a5;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x2715;</button></div><div id="pb" style="display:none;padding:14px 20px"><div style="max-width:360px;margin:0 auto"><div style="display:flex;justify-content:space-between;font-size:11px;color:#64748b;margin-bottom:5px"><span id="pl">...</span><span id="pp">0%</span></div><div style="height:5px;border-radius:3px;background:#e2e8f0;overflow:hidden"><div id="pf" style="height:100%;border-radius:3px;background:#6366f1;width:0;transition:width .3s"></div></div></div></div><div id="hb" style="display:none;text-align:center;padding:7px;font-size:11px;color:#94a3b8"></div><div id="pc" style="padding:20px;display:flex;flex-direction:column;align-items:center"></div></div>';
+function rR(c){c.innerHTML='<div id="rw" style="min-height:100vh"><div style="position:sticky;top:0;z-index:200;background:rgba(15,23,42,.96);padding:7px 14px;display:flex;align-items:center;gap:10px;color:#e2e8f0;font-size:12px"><b>&#x1F4C4;</b> <span style="color:#94a3b8">'+S.fn+'</span> <span style="color:#475569;font-size:10px">'+S.pgs.length+'p</span><div style="flex:1"></div><div id="ta"></div><button onclick="S.sc=Math.max(.5,S.sc-.25);rP()" style="background:rgba(255,255,255,.07);border:none;color:#e2e8f0;width:24px;height:24px;border-radius:4px;cursor:pointer">-</button><span id="zl" style="font-family:monospace;font-size:10px">'+Math.round(S.sc*100)+'%</span><button onclick="S.sc=Math.min(3,S.sc+.25);rP()" style="background:rgba(255,255,255,.07);border:none;color:#e2e8f0;width:24px;height:24px;border-radius:4px;cursor:pointer">+</button> <button onclick="sS()" style="background:rgba(255,255,255,.07);border:none;color:#94a3b8;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x2699;</button> <button onclick="dlLog()" style="background:rgba(255,255,255,.07);border:none;color:#94a3b8;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x1F4CB; Log</button> <button onclick="cancelTranslation();S.pdf=null;S.pgs=[];S.pB=[];S.pT=[];S.sCN=false;render()" style="background:rgba(239,68,68,.1);border:none;color:#fca5a5;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px">&#x2715;</button></div><div id="pb" style="display:none;padding:14px 20px"><div style="max-width:360px;margin:0 auto"><div style="display:flex;justify-content:space-between;font-size:11px;color:#64748b;margin-bottom:5px"><span id="pl">...</span><span id="pp">0%</span></div><div style="height:5px;border-radius:3px;background:#e2e8f0;overflow:hidden"><div id="pf" style="height:100%;border-radius:3px;background:#6366f1;width:0;transition:width .3s"></div></div></div></div><div id="hb" style="display:none;text-align:center;padding:7px;font-size:11px;color:#94a3b8"></div><div id="pc" style="padding:20px;display:flex;flex-direction:column;align-items:center"></div></div>';
 Q("#rw").oncontextmenu=function(e){if(S.busy)return;e.preventDefault();tL()};rP();uT();uH()}
 
 function rP(){var c=Q("#pc");if(!c)return;c.innerHTML="";if(Q("#zl"))Q("#zl").textContent=Math.round(S.sc*100)+"%";
@@ -623,21 +668,26 @@ Q("#sv").onclick=async function(){
   o.remove();render()}})}
 
 /* ===== File Handler ===== */
-async function hF(f){if(!f||f.type!=="application/pdf")return;S.fn=f.name;tLog=[];logEv("file_start",{name:f.name,size:f.size});var buf=await f.arrayBuffer();var st=Q("#us");if(st)st.innerHTML='<span style="color:#6366f1">Loading...</span>';
-try{var doc=await pdfjsLib.getDocument({data:buf}).promise;S.pdf=doc;var pa=[];for(var i=1;i<=doc.numPages;i++)pa.push(await doc.getPage(i));S.pgs=pa;render();S.busy=true;var pb=Q("#pb");if(pb)pb.style.display="block";
-uPr("Analyzing...",0,1);var aB=[],aT="",tE=0;for(var i=0;i<pa.length;i++){var co=await pa[i].getTextContent(),pH=pa[i].getViewport({scale:1}).height,bl=await xB(co.items,pH);aB.push(bl);
+function cancelTranslation(){if(S.abortCtrl){S.abortCtrl.abort();S.abortCtrl=null}S.sessionId++;S.busy=false;console.log("[Cancel] session "+S.sessionId)}
+async function hF(f){if(!f||f.type!=="application/pdf")return;
+/* Cancel any running translation from previous file */
+cancelTranslation();
+S.fn=f.name;S.pdf=null;S.pgs=[];S.pB=[];S.pT=[];S.sCN=false;tLog=[];logEv("file_start",{name:f.name,size:f.size});var buf=await f.arrayBuffer();var st=Q("#us");if(st)st.innerHTML='<span style="color:#6366f1">Loading...</span>';
+var mySession=S.sessionId;var ac=new AbortController();S.abortCtrl=ac;
+try{var doc=await pdfjsLib.getDocument({data:buf}).promise;if(S.sessionId!==mySession)return;S.pdf=doc;var pa=[];for(var i=1;i<=doc.numPages;i++)pa.push(await doc.getPage(i));S.pgs=pa;render();S.busy=true;var pb=Q("#pb");if(pb)pb.style.display="block";
+uPr("Analyzing...",0,1);var aB=[],aT="",tE=0;for(var i=0;i<pa.length;i++){if(S.sessionId!==mySession)return;var co=await pa[i].getTextContent(),pH=pa[i].getViewport({scale:1}).height,bl=await xB(co.items,pH,ac.signal);aB.push(bl);
 /* Log extracted blocks per page */
 logEv("blocks_extracted",{page:i+1,pageHeight:pH,blockCount:bl.length,blocks:bl.map(function(b,bi){return{idx:bi,type:b.isT?"TITLE":b.isB?"BULLET":b.isTableCell?"CELL":"BODY",hasEng:b.has,textLen:b.text.length,text:b.text.slice(0,200),pos:{top:Math.round(b.top*10)/10,l:Math.round(b.l*10)/10,w:Math.round(b.w*10)/10,h:Math.round(b.h*10)/10,fs:Math.round(b.fs*10)/10}}})});
 for(var j=0;j<bl.length;j++){aT+=bl[j].text+"\n";if(bl[j].has)tE++}}
-S.pB=aB;uPr("Domain...",0,1);var ctx=await aC(aT);var allT=[],mG={},dn=0;
-for(var pi=0;pi<aB.length;pi++){var bl2=aB[pi],eb=bl2.filter(function(b){return b.has});if(!eb.length){allT.push(new Array(bl2.length).fill(null));continue}
-var res=await tB(eb,ctx,function(c2){uPr("Translating...",dn+c2,tE)},mG);dn+=eb.length;var full=new Array(bl2.length).fill(null),ti=0;
+S.pB=aB;if(S.sessionId!==mySession)return;uPr("Domain...",0,1);var ctx=await aC(aT,ac.signal);if(S.sessionId!==mySession)return;var allT=[],mG={},dn=0;
+for(var pi=0;pi<aB.length;pi++){if(S.sessionId!==mySession)return;var bl2=aB[pi],eb=bl2.filter(function(b){return b.has});if(!eb.length){allT.push(new Array(bl2.length).fill(null));continue}
+var res=await tB(eb,ctx,function(c2){uPr("Translating...",dn+c2,tE)},mG,ac.signal);if(S.sessionId!==mySession)return;dn+=eb.length;var full=new Array(bl2.length).fill(null),ti=0;
 for(var bi=0;bi<bl2.length;bi++){if(bl2[bi].has){full[bi]=res.translations[ti]||null;ti++}}
 logEv("page_translations",{page:pi+1,translations:full.map(function(t,ti){return{idx:ti,translation:t?t.slice(0,150):null,len:t?t.length:0}})});
 allT.push(full);Object.assign(mG,res.glossary);S.pT=allT.slice();S.glo=Object.assign({},mG);rP()}
 S.pT=allT;S.glo=mG;S.busy=false;S.sCN=true;if(pb)pb.style.display="none";var pb2=Q("#pb");if(pb2)pb2.style.display="none";
 logEv("translation_complete",{pages:allT.length,glossarySize:Object.keys(mG).length,glossary:mG});
-rP();uT();uH()}catch(e){logEv("translation_error",e.message);console.error(e);if(st)st.innerHTML='<span style="color:#ef4444">'+e.message+"</span>"}}
+rP();uT();uH()}catch(e){if(e.name==="AbortError"||S.sessionId!==mySession){console.log("[hF] Cancelled session "+mySession);return}logEv("translation_error",e.message);console.error(e);if(st)st.innerHTML='<span style="color:#ef4444">'+e.message+"</span>"}}
 
 function uPr(l,c,t){var p=t>0?Math.round(c/t*100):0;var el=Q("#pl");if(el)el.textContent=l;var pe=Q("#pp");if(pe)pe.textContent=p+"%";var pf=Q("#pf");if(pf)pf.style.width=p+"%"}
 render();
